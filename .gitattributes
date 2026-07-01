@@ -1,0 +1,7 @@
+*.bat text eol=crlf
+*.command text eol=lf
+*.html text eol=lf
+*.md text eol=lf
+*.py text eol=lf
+*.swift text eol=lf
+*.txt text eol=lf

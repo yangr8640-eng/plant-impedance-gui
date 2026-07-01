@@ -1,0 +1,14 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Local build output
+ResistanceGUI
+
+# Generated reports and exports
+output/
+report_output/
+*.pdf
+
+# Local notes and temporary data
+*.log

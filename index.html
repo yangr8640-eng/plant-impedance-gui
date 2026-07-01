@@ -1,0 +1,1280 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>实时电阻曲线</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f7fb;
+      --surface: #ffffff;
+      --surface-2: #eef3f9;
+      --text: #162033;
+      --muted: #617089;
+      --border: #d9e1ed;
+      --accent: #147a72;
+      --accent-2: #e5743f;
+      --danger: #b42318;
+      --grid: rgba(50, 67, 91, 0.13);
+      --shadow: 0 16px 42px rgba(22, 32, 51, 0.10);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        linear-gradient(180deg, rgba(20, 122, 114, 0.08), transparent 280px),
+        var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    }
+
+    button,
+    input,
+    select {
+      font: inherit;
+    }
+
+    .app {
+      width: min(1440px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 24px 0 32px;
+    }
+
+    header {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 20px;
+      padding: 8px 0 18px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(28px, 4vw, 44px);
+      line-height: 1.04;
+      letter-spacing: 0;
+    }
+
+    .subtitle {
+      margin: 10px 0 0;
+      max-width: 780px;
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.7;
+    }
+
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 40px;
+      padding: 0 14px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.78);
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+    .status-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: #8a98ad;
+      box-shadow: 0 0 0 4px rgba(138, 152, 173, 0.16);
+    }
+
+    .status.connected .status-dot,
+    .status.simulating .status-dot {
+      background: var(--accent);
+      box-shadow: 0 0 0 4px rgba(20, 122, 114, 0.16);
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(260px, 340px) minmax(0, 1fr);
+      gap: 16px;
+      align-items: start;
+    }
+
+    .panel {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.92);
+      box-shadow: var(--shadow);
+    }
+
+    .controls {
+      padding: 16px;
+    }
+
+    .control-group {
+      padding: 14px 0;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .control-group:first-child {
+      padding-top: 0;
+    }
+
+    .control-group:last-child {
+      padding-bottom: 0;
+      border-bottom: 0;
+    }
+
+    .group-title {
+      margin: 0 0 12px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .field {
+      display: grid;
+      gap: 6px;
+      margin-bottom: 12px;
+    }
+
+    .field:last-child {
+      margin-bottom: 0;
+    }
+
+    label {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    input,
+    select {
+      width: 100%;
+      min-height: 38px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--surface);
+      color: var(--text);
+      padding: 0 10px;
+      outline: none;
+    }
+
+    input:focus,
+    select:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(20, 122, 114, 0.16);
+    }
+
+    .button-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+
+    button {
+      min-height: 40px;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      padding: 0 12px;
+      cursor: pointer;
+      background: var(--surface-2);
+      color: var(--text);
+      transition: transform 120ms ease, background 120ms ease, border-color 120ms ease;
+    }
+
+    button:hover:not(:disabled) {
+      transform: translateY(-1px);
+    }
+
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.48;
+    }
+
+    .primary {
+      background: var(--accent);
+      color: #fff;
+    }
+
+    .secondary {
+      border-color: var(--border);
+      background: #fff;
+    }
+
+    .warn {
+      background: rgba(229, 116, 63, 0.14);
+      color: #8a3b13;
+    }
+
+    .danger {
+      background: rgba(180, 35, 24, 0.1);
+      color: var(--danger);
+    }
+
+    .chart-panel {
+      overflow: hidden;
+    }
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 1px;
+      background: var(--border);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .metric {
+      min-width: 0;
+      background: rgba(255, 255, 255, 0.96);
+      padding: 14px 16px;
+    }
+
+    .metric span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.3;
+    }
+
+    .metric strong {
+      display: block;
+      margin-top: 6px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: clamp(18px, 2.4vw, 28px);
+      line-height: 1.1;
+      letter-spacing: 0;
+    }
+
+    .canvas-wrap {
+      position: relative;
+      height: min(62vh, 650px);
+      min-height: 420px;
+      background: #fbfcff;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+
+    .empty-hint {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      color: var(--muted);
+      text-align: center;
+      pointer-events: none;
+    }
+
+    .empty-hint.hidden {
+      display: none;
+    }
+
+    .log-panel {
+      margin-top: 16px;
+      padding: 14px 16px;
+    }
+
+    .log-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .log {
+      height: 132px;
+      margin: 12px 0 0;
+      overflow: auto;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: #111827;
+      color: #d8dee9;
+      padding: 10px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      font-size: 12px;
+      line-height: 1.55;
+      white-space: pre-wrap;
+    }
+
+    .notice {
+      margin-top: 12px;
+      border-left: 3px solid var(--accent-2);
+      padding: 10px 12px;
+      background: rgba(229, 116, 63, 0.1);
+      color: #6f3a1b;
+      font-size: 13px;
+      line-height: 1.7;
+    }
+
+    .diagnostics {
+      display: grid;
+      gap: 8px;
+      margin-top: 12px;
+      font-size: 12px;
+    }
+
+    .diagnostic-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: rgba(238, 243, 249, 0.62);
+      padding: 8px 10px;
+    }
+
+    .diagnostic-row span:first-child {
+      color: var(--muted);
+    }
+
+    .diagnostic-row strong {
+      color: var(--text);
+      font-weight: 700;
+      text-align: right;
+      overflow-wrap: anywhere;
+    }
+
+    .diagnostic-row strong.ok {
+      color: var(--accent);
+    }
+
+    .diagnostic-row strong.bad {
+      color: var(--danger);
+    }
+
+    .two-col {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+
+    .checkbox {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--text);
+      font-size: 14px;
+    }
+
+    .checkbox input {
+      width: 16px;
+      min-height: 16px;
+      accent-color: var(--accent);
+    }
+
+    @media (max-width: 980px) {
+      header {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .layout {
+        grid-template-columns: 1fr;
+      }
+
+      .stats {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 560px) {
+      .app {
+        width: min(100vw - 20px, 1440px);
+        padding-top: 14px;
+      }
+
+      .button-grid,
+      .two-col,
+      .stats {
+        grid-template-columns: 1fr;
+      }
+
+      .canvas-wrap {
+        min-height: 360px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <header>
+      <div>
+        <h1>实时电阻曲线</h1>
+        <p class="subtitle">直接读取硬件串口数据，把电阻作为 y 轴、时间作为 x 轴绘图。串口每行可以是纯数字，也可以是类似 R=12.3kΩ、resistance: 470 ohm 的文本。</p>
+      </div>
+      <div class="status" id="status">
+        <span class="status-dot"></span>
+        <span id="statusText">未连接</span>
+      </div>
+    </header>
+
+    <section class="layout">
+      <aside class="panel controls" aria-label="串口和图表控制">
+        <div class="control-group">
+          <p class="group-title">串口</p>
+          <div class="field">
+            <label for="baudRate">波特率</label>
+            <select id="baudRate">
+              <option value="9600">9600</option>
+              <option value="19200">19200</option>
+              <option value="38400">38400</option>
+              <option value="57600">57600</option>
+              <option value="115200" selected>115200</option>
+              <option value="230400">230400</option>
+            </select>
+          </div>
+          <div class="two-col">
+            <div class="field">
+              <label for="dataBits">数据位</label>
+              <select id="dataBits">
+                <option value="8" selected>8</option>
+                <option value="7">7</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="stopBits">停止位</label>
+              <select id="stopBits">
+                <option value="1" selected>1</option>
+                <option value="2">2</option>
+              </select>
+            </div>
+          </div>
+          <div class="field">
+            <label for="parity">校验位</label>
+            <select id="parity">
+              <option value="none" selected>无</option>
+              <option value="even">偶校验</option>
+              <option value="odd">奇校验</option>
+            </select>
+          </div>
+          <div class="button-grid">
+            <button class="primary" id="connectBtn">连接串口</button>
+            <button class="danger" id="disconnectBtn" disabled>断开</button>
+          </div>
+          <div class="notice" id="serialNotice"></div>
+          <div class="diagnostics" aria-label="串口连接诊断">
+            <div class="diagnostic-row">
+              <span>浏览器串口</span>
+              <strong id="diagSerial">--</strong>
+            </div>
+            <div class="diagnostic-row">
+              <span>安全上下文</span>
+              <strong id="diagSecure">--</strong>
+            </div>
+            <div class="diagnostic-row">
+              <span>页面来源</span>
+              <strong id="diagOrigin">--</strong>
+            </div>
+            <div class="diagnostic-row">
+              <span>收到字节</span>
+              <strong id="diagBytes">0</strong>
+            </div>
+            <div class="diagnostic-row">
+              <span>解析成功</span>
+              <strong id="diagParsed">0</strong>
+            </div>
+            <div class="diagnostic-row">
+              <span>最近错误</span>
+              <strong id="diagError">无</strong>
+            </div>
+          </div>
+        </div>
+
+        <div class="control-group">
+          <p class="group-title">曲线</p>
+          <div class="two-col">
+            <div class="field">
+              <label for="windowSeconds">显示窗口 秒</label>
+              <input id="windowSeconds" type="number" min="5" max="3600" step="5" value="120">
+            </div>
+            <div class="field">
+              <label for="maxPoints">最大点数</label>
+              <input id="maxPoints" type="number" min="50" max="20000" step="50" value="2000">
+            </div>
+          </div>
+          <div class="two-col">
+            <div class="field">
+              <label for="unitMode">显示单位</label>
+              <select id="unitMode">
+                <option value="auto" selected>自动</option>
+                <option value="ohm">Ω</option>
+                <option value="kohm">kΩ</option>
+                <option value="mohm">MΩ</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="smoothFactor">平滑 0-90</label>
+              <input id="smoothFactor" type="number" min="0" max="90" step="5" value="0">
+            </div>
+          </div>
+          <label class="checkbox" for="autoScale">
+            <input id="autoScale" type="checkbox" checked>
+            y 轴自动缩放
+          </label>
+          <div class="two-col" style="margin-top: 12px;">
+            <div class="field">
+              <label for="yMin">y 最小值 Ω</label>
+              <input id="yMin" type="number" value="0" disabled>
+            </div>
+            <div class="field">
+              <label for="yMax">y 最大值 Ω</label>
+              <input id="yMax" type="number" value="1000" disabled>
+            </div>
+          </div>
+        </div>
+
+        <div class="control-group">
+          <p class="group-title">操作</p>
+          <div class="button-grid">
+            <button class="warn" id="simulateBtn">模拟数据</button>
+            <button class="secondary" id="clearBtn">清空曲线</button>
+            <button class="secondary" id="exportBtn">导出 CSV</button>
+            <button class="secondary" id="copySampleBtn">复制示例</button>
+          </div>
+        </div>
+      </aside>
+
+      <section>
+        <div class="panel chart-panel">
+          <div class="stats" aria-label="实时统计">
+            <div class="metric">
+              <span>当前电阻</span>
+              <strong id="currentValue">--</strong>
+            </div>
+            <div class="metric">
+              <span>平均值</span>
+              <strong id="avgValue">--</strong>
+            </div>
+            <div class="metric">
+              <span>最小值</span>
+              <strong id="minValue">--</strong>
+            </div>
+            <div class="metric">
+              <span>最大值</span>
+              <strong id="maxValue">--</strong>
+            </div>
+          </div>
+          <div class="canvas-wrap">
+            <canvas id="chart" aria-label="电阻随时间变化曲线"></canvas>
+            <div class="empty-hint" id="emptyHint">连接串口或启动模拟数据后，曲线会显示在这里。</div>
+          </div>
+        </div>
+
+        <div class="panel log-panel">
+          <div class="log-head">
+            <span>接收日志</span>
+            <span id="pointCount">0 个数据点</span>
+          </div>
+          <pre class="log" id="log"></pre>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <script>
+    const state = {
+      port: null,
+      reader: null,
+      keepReading: false,
+      startTime: null,
+      data: [],
+      rawBytes: 0,
+      rawLines: 0,
+      smoothValue: null,
+      simulationTimer: null,
+      lastError: ""
+    };
+
+    const elements = {
+      status: document.getElementById("status"),
+      statusText: document.getElementById("statusText"),
+      baudRate: document.getElementById("baudRate"),
+      dataBits: document.getElementById("dataBits"),
+      stopBits: document.getElementById("stopBits"),
+      parity: document.getElementById("parity"),
+      connectBtn: document.getElementById("connectBtn"),
+      disconnectBtn: document.getElementById("disconnectBtn"),
+      simulateBtn: document.getElementById("simulateBtn"),
+      clearBtn: document.getElementById("clearBtn"),
+      exportBtn: document.getElementById("exportBtn"),
+      copySampleBtn: document.getElementById("copySampleBtn"),
+      windowSeconds: document.getElementById("windowSeconds"),
+      maxPoints: document.getElementById("maxPoints"),
+      unitMode: document.getElementById("unitMode"),
+      smoothFactor: document.getElementById("smoothFactor"),
+      autoScale: document.getElementById("autoScale"),
+      yMin: document.getElementById("yMin"),
+      yMax: document.getElementById("yMax"),
+      currentValue: document.getElementById("currentValue"),
+      avgValue: document.getElementById("avgValue"),
+      minValue: document.getElementById("minValue"),
+      maxValue: document.getElementById("maxValue"),
+      pointCount: document.getElementById("pointCount"),
+      serialNotice: document.getElementById("serialNotice"),
+      diagSerial: document.getElementById("diagSerial"),
+      diagSecure: document.getElementById("diagSecure"),
+      diagOrigin: document.getElementById("diagOrigin"),
+      diagBytes: document.getElementById("diagBytes"),
+      diagParsed: document.getElementById("diagParsed"),
+      diagError: document.getElementById("diagError"),
+      canvas: document.getElementById("chart"),
+      emptyHint: document.getElementById("emptyHint"),
+      log: document.getElementById("log")
+    };
+
+    const ctx = elements.canvas.getContext("2d");
+
+    function nowSeconds() {
+      if (!state.startTime) {
+        state.startTime = performance.now();
+      }
+      return (performance.now() - state.startTime) / 1000;
+    }
+
+    function setStatus(mode, text) {
+      elements.status.className = `status ${mode || ""}`.trim();
+      elements.statusText.textContent = text;
+    }
+
+    function serialSupported() {
+      return "serial" in navigator && window.isSecureContext;
+    }
+
+    function setDiagnosticValue(element, text, ok) {
+      element.textContent = text;
+      element.className = ok ? "ok" : "bad";
+    }
+
+    function updateSerialDiagnostics() {
+      const hasSerial = "serial" in navigator;
+      setDiagnosticValue(elements.diagSerial, hasSerial ? "支持" : "不支持", hasSerial);
+      setDiagnosticValue(elements.diagSecure, window.isSecureContext ? "正常" : "不安全", window.isSecureContext);
+      elements.diagOrigin.textContent = window.location.origin;
+      elements.diagOrigin.className = "";
+      elements.diagBytes.textContent = String(state.rawBytes);
+      elements.diagBytes.className = state.rawBytes > 0 ? "ok" : "";
+      elements.diagParsed.textContent = String(state.data.length);
+      elements.diagParsed.className = state.data.length > 0 ? "ok" : "";
+      elements.diagError.textContent = state.lastError || "无";
+      elements.diagError.className = state.lastError ? "bad" : "ok";
+    }
+
+    function describeSerialError(error) {
+      if (!error) {
+        return "未知错误";
+      }
+      if (error.name === "NotFoundError") {
+        return "没有选择串口；如果弹窗里没有设备，请检查 USB 线、驱动和系统权限。";
+      }
+      if (error.name === "InvalidStateError") {
+        return "串口可能已经被打开；请先断开 SSCOM 或其他串口软件。";
+      }
+      if (error.name === "NetworkError") {
+        return "系统无法打开该串口；常见原因是端口被 SSCOM 占用、USB 转串口驱动异常或设备刚断开。";
+      }
+      if (error.name === "SecurityError") {
+        return "浏览器阻止了串口权限；请用 Chrome/Edge 打开 localhost 页面。";
+      }
+      return `${error.name || "Error"}：${error.message || "连接失败"}`;
+    }
+
+    function updateSerialNotice() {
+      updateSerialDiagnostics();
+      if (!("serial" in navigator)) {
+        elements.serialNotice.textContent = "当前浏览器不支持 Web Serial。请用 Chrome 或 Edge 打开 localhost 页面。";
+        elements.connectBtn.disabled = true;
+        return;
+      }
+      if (!window.isSecureContext) {
+        elements.serialNotice.textContent = "串口访问需要安全上下文。建议用本地服务打开，例如 python3 -m http.server 5173。";
+        elements.connectBtn.disabled = true;
+        return;
+      }
+      elements.serialNotice.textContent = "连接前请先在 SSCOM 中断开同一个串口，否则浏览器可能无法打开该端口。";
+    }
+
+    function parseResistance(raw) {
+      const line = raw.trim();
+      if (!line) {
+        return null;
+      }
+
+      const unitPattern = "(MΩ|MOhm|Mohm|兆欧|mΩ|mohm|毫欧|[kK]Ω|[kK][oO][hH][mM]|千欧|Ω|[oO][hH][mM]|欧姆|欧)?";
+      const numberPattern = "([-+]?(?:\\d[\\d,]*\\.?\\d*|\\.\\d+)(?:[eE][-+]?\\d+)?)";
+      const labelPattern = "(?:R_s|R_S|r_s|r_S|R[sS]|r[sS]|R|r|resistance|Resistance|RESISTANCE|res|Res|RES|电阻)";
+      const markedValue = new RegExp(`(?:^|[\\s,;])${labelPattern}\\s*[:=]\\s*${numberPattern}\\s*${unitPattern}`).exec(line);
+      const firstValue = new RegExp(`${numberPattern}\\s*${unitPattern}`).exec(line);
+      const match = markedValue || firstValue;
+
+      if (!match) {
+        return null;
+      }
+
+      const value = Number(match[1].replace(/,/g, ""));
+      if (!Number.isFinite(value)) {
+        return null;
+      }
+
+      const unit = match[2] || "";
+      if (/^(MΩ|MOhm|Mohm|兆欧)$/.test(unit)) {
+        return value * 1000000;
+      }
+      if (/^(mΩ|mohm|毫欧)$/.test(unit)) {
+        return value / 1000;
+      }
+      if (/^(kΩ|KΩ|kohm|千欧)$/i.test(unit)) {
+        return value * 1000;
+      }
+      return value;
+    }
+
+    function resolveUnit(preferredUnit, values) {
+      if (preferredUnit !== "auto") {
+        return preferredUnit;
+      }
+      const maxAbs = Math.max(0, ...values.map((value) => Math.abs(value)).filter(Number.isFinite));
+      if (maxAbs >= 1000000) {
+        return "mohm";
+      }
+      if (maxAbs >= 1000) {
+        return "kohm";
+      }
+      return "ohm";
+    }
+
+    function formatResistance(ohms, preferredUnit, resolvedUnit) {
+      if (!Number.isFinite(ohms)) {
+        return "--";
+      }
+
+      const unit = resolvedUnit || resolveUnit(preferredUnit, [ohms]);
+
+      if (unit === "mohm") {
+        return `${trimNumber(ohms / 1000000)} MΩ`;
+      }
+      if (unit === "kohm") {
+        return `${trimNumber(ohms / 1000)} kΩ`;
+      }
+      return `${trimNumber(ohms)} Ω`;
+    }
+
+    function unitScale(unit) {
+      if (unit === "mohm") {
+        return { factor: 1000000, label: "MΩ" };
+      }
+      if (unit === "kohm") {
+        return { factor: 1000, label: "kΩ" };
+      }
+      return { factor: 1, label: "Ω" };
+    }
+
+    function trimNumber(value) {
+      const abs = Math.abs(value);
+      if (abs === 0) {
+        return "0";
+      }
+      if (abs >= 100) {
+        return value.toFixed(1).replace(/\.0$/, "");
+      }
+      if (abs >= 10) {
+        return value.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
+      }
+      return value.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
+    }
+
+    function addDataPoint(ohms, raw) {
+      const smoothing = clamp(Number(elements.smoothFactor.value) || 0, 0, 90) / 100;
+      let plotted = ohms;
+      if (smoothing > 0 && state.smoothValue !== null) {
+        plotted = state.smoothValue * smoothing + ohms * (1 - smoothing);
+      }
+      state.smoothValue = plotted;
+
+      state.data.push({
+        t: nowSeconds(),
+        value: plotted,
+        rawValue: ohms,
+        raw
+      });
+
+      const maxPoints = Math.max(50, Number(elements.maxPoints.value) || 2000);
+      if (state.data.length > maxPoints) {
+        state.data.splice(0, state.data.length - maxPoints);
+      }
+
+      elements.serialNotice.textContent = "已解析到电阻数据，曲线正在更新。";
+      appendLog(raw, ohms);
+      updateStats();
+      updateSerialDiagnostics();
+      drawChart();
+    }
+
+    function appendLog(raw, ohms) {
+      state.rawLines += 1;
+      const prefix = new Date().toLocaleTimeString();
+      const visibleRaw = showControlCharacters(raw);
+      const line = ohms === null
+        ? `[${prefix}] 未解析  <=  ${visibleRaw}`
+        : `[${prefix}] ${formatResistance(ohms, elements.unitMode.value)}  <=  ${visibleRaw}`;
+      elements.log.textContent += `${line}\n`;
+      const lines = elements.log.textContent.split("\n");
+      if (lines.length > 140) {
+        elements.log.textContent = lines.slice(-120).join("\n");
+      }
+      elements.log.scrollTop = elements.log.scrollHeight;
+    }
+
+    function showControlCharacters(value) {
+      return value
+        .replace(/\r/g, "\\r")
+        .replace(/\n/g, "\\n")
+        .replace(/\t/g, "\\t");
+    }
+
+    function updateStats() {
+      const data = visibleData();
+      elements.pointCount.textContent = `${state.data.length} 个数据点 / ${state.rawLines} 条原始记录`;
+      elements.emptyHint.classList.toggle("hidden", state.data.length > 0);
+
+      if (data.length === 0) {
+        elements.currentValue.textContent = "--";
+        elements.avgValue.textContent = "--";
+        elements.minValue.textContent = "--";
+        elements.maxValue.textContent = "--";
+        return;
+      }
+
+      const values = data.map((point) => point.rawValue);
+      const latest = values[values.length - 1];
+      const sum = values.reduce((acc, value) => acc + value, 0);
+      const min = Math.min(...values);
+      const max = Math.max(...values);
+      const unit = elements.unitMode.value;
+      const resolvedUnit = resolveUnit(unit, values);
+
+      elements.currentValue.textContent = formatResistance(latest, unit, resolvedUnit);
+      elements.avgValue.textContent = formatResistance(sum / values.length, unit, resolvedUnit);
+      elements.minValue.textContent = formatResistance(min, unit, resolvedUnit);
+      elements.maxValue.textContent = formatResistance(max, unit, resolvedUnit);
+    }
+
+    function visibleData() {
+      if (state.data.length === 0) {
+        return [];
+      }
+      const windowSeconds = Math.max(5, Number(elements.windowSeconds.value) || 120);
+      const latest = state.data[state.data.length - 1].t;
+      return state.data.filter((point) => latest - point.t <= windowSeconds);
+    }
+
+    function chartRange(data) {
+      const latest = data.length ? data[data.length - 1].t : 0;
+      const windowSeconds = Math.max(5, Number(elements.windowSeconds.value) || 120);
+      const minX = Math.max(0, latest - windowSeconds);
+      const maxX = Math.max(windowSeconds, latest);
+
+      let minY = 0;
+      let maxY = 1;
+
+      if (elements.autoScale.checked) {
+        const values = data.map((point) => point.value);
+        if (values.length > 0) {
+          minY = Math.min(...values);
+          maxY = Math.max(...values);
+          if (minY === maxY) {
+            minY -= Math.max(1, Math.abs(minY) * 0.05);
+            maxY += Math.max(1, Math.abs(maxY) * 0.05);
+          }
+          const pad = (maxY - minY) * 0.12;
+          minY -= pad;
+          maxY += pad;
+        }
+      } else {
+        minY = Number(elements.yMin.value);
+        maxY = Number(elements.yMax.value);
+        if (!Number.isFinite(minY) || !Number.isFinite(maxY) || minY >= maxY) {
+          minY = 0;
+          maxY = 1;
+        }
+      }
+
+      return { minX, maxX, minY, maxY };
+    }
+
+    function drawChart() {
+      const rect = elements.canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      const width = Math.max(320, rect.width);
+      const height = Math.max(280, rect.height);
+
+      elements.canvas.width = Math.round(width * dpr);
+      elements.canvas.height = Math.round(height * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, width, height);
+
+      const data = visibleData();
+      const margin = {
+        top: 28,
+        right: 28,
+        bottom: 46,
+        left: width < 620 ? 58 : 74
+      };
+      const plotW = width - margin.left - margin.right;
+      const plotH = height - margin.top - margin.bottom;
+      const range = chartRange(data);
+      const resolvedUnit = resolveUnit(elements.unitMode.value, data.map((point) => point.value));
+      const scale = unitScale(resolvedUnit);
+
+      drawGrid(width, height, margin, plotW, plotH, range, scale);
+
+      if (data.length < 2) {
+        return;
+      }
+
+      const x = (value) => margin.left + ((value - range.minX) / (range.maxX - range.minX)) * plotW;
+      const y = (value) => margin.top + (1 - (value - range.minY) / (range.maxY - range.minY)) * plotH;
+
+      ctx.save();
+      ctx.beginPath();
+      data.forEach((point, index) => {
+        const px = x(point.t);
+        const py = y(point.value);
+        if (index === 0) {
+          ctx.moveTo(px, py);
+        } else {
+          ctx.lineTo(px, py);
+        }
+      });
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = "#147a72";
+      ctx.stroke();
+
+      const latest = data[data.length - 1];
+      ctx.beginPath();
+      ctx.arc(x(latest.t), y(latest.value), 5, 0, Math.PI * 2);
+      ctx.fillStyle = "#e5743f";
+      ctx.fill();
+      ctx.restore();
+    }
+
+    function drawGrid(width, height, margin, plotW, plotH, range, scale) {
+      const styles = getComputedStyle(document.documentElement);
+      const grid = styles.getPropertyValue("--grid").trim();
+      const muted = styles.getPropertyValue("--muted").trim();
+      const text = styles.getPropertyValue("--text").trim();
+
+      ctx.save();
+      ctx.fillStyle = "#fbfcff";
+      ctx.fillRect(0, 0, width, height);
+      ctx.strokeStyle = grid;
+      ctx.lineWidth = 1;
+      ctx.font = "12px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
+      ctx.fillStyle = muted;
+
+      const xSteps = 6;
+      for (let i = 0; i <= xSteps; i += 1) {
+        const ratio = i / xSteps;
+        const px = margin.left + ratio * plotW;
+        const seconds = range.minX + ratio * (range.maxX - range.minX);
+        ctx.beginPath();
+        ctx.moveTo(px, margin.top);
+        ctx.lineTo(px, margin.top + plotH);
+        ctx.stroke();
+        ctx.fillText(`${trimNumber(seconds)}s`, px - 14, margin.top + plotH + 28);
+      }
+
+      const ySteps = 5;
+      for (let i = 0; i <= ySteps; i += 1) {
+        const ratio = i / ySteps;
+        const py = margin.top + ratio * plotH;
+        const value = range.maxY - ratio * (range.maxY - range.minY);
+        ctx.beginPath();
+        ctx.moveTo(margin.left, py);
+        ctx.lineTo(margin.left + plotW, py);
+        ctx.stroke();
+        ctx.fillText(trimNumber(value / scale.factor), 12, py + 4);
+      }
+
+      ctx.strokeStyle = "rgba(22, 32, 51, 0.45)";
+      ctx.beginPath();
+      ctx.moveTo(margin.left, margin.top);
+      ctx.lineTo(margin.left, margin.top + plotH);
+      ctx.lineTo(margin.left + plotW, margin.top + plotH);
+      ctx.stroke();
+
+      ctx.fillStyle = text;
+      ctx.font = "600 13px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
+      ctx.fillText(`电阻 ${scale.label}`, margin.left, 18);
+      ctx.fillText("时间 s", width - margin.right - 52, height - 14);
+      ctx.restore();
+    }
+
+    async function connectSerial() {
+      if (!serialSupported()) {
+        updateSerialNotice();
+        return;
+      }
+      stopSimulation();
+      try {
+        state.lastError = "";
+        updateSerialDiagnostics();
+        const port = await navigator.serial.requestPort();
+        await port.open({
+          baudRate: Number(elements.baudRate.value),
+          dataBits: Number(elements.dataBits.value),
+          stopBits: Number(elements.stopBits.value),
+          parity: elements.parity.value,
+          flowControl: "none"
+        });
+
+        state.port = port;
+        state.keepReading = true;
+        elements.connectBtn.disabled = true;
+        elements.disconnectBtn.disabled = false;
+        elements.serialNotice.textContent = "串口已成功打开，正在等待硬件发送电阻数据。";
+        setStatus("connected", "串口已连接");
+        updateSerialDiagnostics();
+        readLoop();
+      } catch (error) {
+        setStatus("", "连接失败");
+        state.lastError = describeSerialError(error);
+        elements.serialNotice.textContent = `连接失败：${state.lastError}`;
+        updateSerialDiagnostics();
+      }
+    }
+
+    async function readLoop() {
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let pendingFlushTimer = null;
+
+      const flushPendingBuffer = () => {
+        pendingFlushTimer = null;
+        const pending = buffer.trim();
+        buffer = "";
+        if (pending) {
+          handleLine(pending);
+        }
+      };
+
+      while (state.port && state.port.readable && state.keepReading) {
+        state.reader = state.port.readable.getReader();
+        try {
+          while (state.keepReading) {
+            const { value, done } = await state.reader.read();
+            if (done) {
+              break;
+            }
+            state.rawBytes += value.byteLength;
+            updateSerialDiagnostics();
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split(/[\r\n]+/);
+            buffer = lines.pop() || "";
+            lines.forEach(handleLine);
+            if (pendingFlushTimer) {
+              window.clearTimeout(pendingFlushTimer);
+            }
+            if (buffer.trim()) {
+              pendingFlushTimer = window.setTimeout(flushPendingBuffer, 350);
+            }
+          }
+        } catch (error) {
+          state.lastError = describeSerialError(error);
+          elements.serialNotice.textContent = `读取中断：${state.lastError}`;
+          updateSerialDiagnostics();
+        } finally {
+          if (pendingFlushTimer) {
+            window.clearTimeout(pendingFlushTimer);
+          }
+          state.reader.releaseLock();
+          state.reader = null;
+        }
+      }
+    }
+
+    function handleLine(line) {
+      const cleanLine = line.trim();
+      if (!cleanLine) {
+        return;
+      }
+      const ohms = parseResistance(cleanLine);
+      if (ohms === null) {
+        elements.serialNotice.textContent = "已收到串口数据，但没有解析出电阻值；请看接收日志中的原始内容。";
+        appendLog(cleanLine, null);
+        updateStats();
+        updateSerialDiagnostics();
+        return;
+      }
+      addDataPoint(ohms, cleanLine);
+    }
+
+    async function disconnectSerial() {
+      state.keepReading = false;
+      if (state.reader) {
+        try {
+          await state.reader.cancel();
+        } catch (error) {
+          console.warn(error);
+        }
+      }
+      if (state.port) {
+        try {
+          await state.port.close();
+        } catch (error) {
+          console.warn(error);
+        }
+      }
+      state.port = null;
+      elements.connectBtn.disabled = !serialSupported();
+      elements.disconnectBtn.disabled = true;
+      setStatus("", "未连接");
+      updateSerialDiagnostics();
+    }
+
+    function toggleSimulation() {
+      if (state.simulationTimer) {
+        stopSimulation();
+        return;
+      }
+      disconnectSerial();
+      let phase = 0;
+      setStatus("simulating", "模拟数据中");
+      elements.simulateBtn.textContent = "停止模拟";
+      state.simulationTimer = window.setInterval(() => {
+        phase += 0.16;
+        const baseline = 820 + 180 * Math.sin(phase / 2.5);
+        const ripple = 38 * Math.sin(phase * 2.3);
+        const drift = 0.9 * Math.pow(Math.max(0, nowSeconds() - 10), 0.75);
+        const noise = (Math.random() - 0.5) * 24;
+        const value = Math.max(0.1, baseline + ripple + drift + noise);
+        addDataPoint(value, `R=${trimNumber(value)} ohm`);
+      }, 350);
+    }
+
+    function stopSimulation() {
+      if (!state.simulationTimer) {
+        return;
+      }
+      window.clearInterval(state.simulationTimer);
+      state.simulationTimer = null;
+      elements.simulateBtn.textContent = "模拟数据";
+      if (!state.port) {
+        setStatus("", "未连接");
+      }
+    }
+
+    function clearData() {
+      state.startTime = null;
+      state.data = [];
+      state.rawBytes = 0;
+      state.smoothValue = null;
+      state.rawLines = 0;
+      elements.log.textContent = "";
+      updateStats();
+      updateSerialDiagnostics();
+      drawChart();
+    }
+
+    function exportCsv() {
+      if (state.data.length === 0) {
+        return;
+      }
+      const rows = ["time_s,resistance_ohm,raw_resistance_ohm,raw_line"];
+      state.data.forEach((point) => {
+        rows.push([
+          point.t.toFixed(3),
+          point.value.toFixed(6),
+          point.rawValue.toFixed(6),
+          `"${point.raw.replace(/"/g, '""')}"`
+        ].join(","));
+      });
+      const blob = new Blob([rows.join("\n")], { type: "text/csv;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `resistance-${new Date().toISOString().replace(/[:.]/g, "-")}.csv`;
+      link.click();
+      URL.revokeObjectURL(url);
+    }
+
+    async function copySample() {
+      const sample = "R=1012.4 ohm\nR=1.016 kΩ\nresistance: 998.2 Ω";
+      try {
+        await navigator.clipboard.writeText(sample);
+        elements.copySampleBtn.textContent = "已复制";
+        window.setTimeout(() => {
+          elements.copySampleBtn.textContent = "复制示例";
+        }, 1200);
+      } catch (error) {
+        elements.serialNotice.textContent = `复制失败：${error.message}`;
+      }
+    }
+
+    function clamp(value, min, max) {
+      return Math.min(max, Math.max(min, value));
+    }
+
+    function bindEvents() {
+      elements.connectBtn.addEventListener("click", connectSerial);
+      elements.disconnectBtn.addEventListener("click", disconnectSerial);
+      elements.simulateBtn.addEventListener("click", toggleSimulation);
+      elements.clearBtn.addEventListener("click", clearData);
+      elements.exportBtn.addEventListener("click", exportCsv);
+      elements.copySampleBtn.addEventListener("click", copySample);
+      elements.autoScale.addEventListener("change", () => {
+        elements.yMin.disabled = elements.autoScale.checked;
+        elements.yMax.disabled = elements.autoScale.checked;
+        drawChart();
+      });
+      [
+        elements.windowSeconds,
+        elements.maxPoints,
+        elements.unitMode,
+        elements.smoothFactor,
+        elements.yMin,
+        elements.yMax
+      ].forEach((input) => {
+        input.addEventListener("input", () => {
+          updateStats();
+          drawChart();
+        });
+      });
+
+      window.addEventListener("resize", drawChart);
+      if ("serial" in navigator) {
+        navigator.serial.addEventListener("disconnect", async (event) => {
+          if (event.target === state.port) {
+            await disconnectSerial();
+            state.lastError = "串口设备已断开。";
+            elements.serialNotice.textContent = "串口设备已断开。";
+            updateSerialDiagnostics();
+          }
+        });
+      }
+    }
+
+    updateSerialNotice();
+    bindEvents();
+    updateStats();
+    drawChart();
+    window.resistanceApp = {
+      parseResistance,
+      formatResistance
+    };
+  </script>
+</body>
+</html>
