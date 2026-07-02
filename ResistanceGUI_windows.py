@@ -1,8 +1,10 @@
 import csv
 import math
+import os
 import queue
 import random
 import re
+import shutil
 import threading
 import time
 import tkinter as tk
@@ -59,6 +61,15 @@ def trim_number(value):
     if absolute >= 10:
         return f"{value:.2f}".rstrip("0").rstrip(".")
     return f"{value:.3f}".rstrip("0").rstrip(".")
+
+
+def format_time_axis(seconds):
+    absolute = abs(seconds)
+    if absolute >= 3600:
+        return f"{trim_number(seconds / 3600)}h"
+    if absolute >= 60:
+        return f"{trim_number(seconds / 60)}m"
+    return f"{trim_number(seconds)}s"
 
 
 def axis_label(value, step=None):
@@ -352,7 +363,7 @@ class SimplePDFReport:
             gx = plot_x + ratio * plot_w
             self._line(content, gx, plot_y, gx, plot_y + plot_h, 0.82, 0.86, 0.92, 0.5)
             seconds = min_x + ratio * (max_x - min_x)
-            self._text(content, f"{trim_number(seconds)}s", gx - 10, plot_y - 18, 8, 0.38, 0.44, 0.54)
+            self._text(content, format_time_axis(seconds), gx - 10, plot_y - 18, 8, 0.38, 0.44, 0.54)
 
         for value in y_tick_values(min_y, max_y, grid_step):
             ratio = (value - min_y) / max(max_y - min_y, 0.001)
@@ -361,7 +372,7 @@ class SimplePDFReport:
             self._text(content, axis_label(value / factor, grid_step / factor if grid_step else None), x + 5, gy - 3, 8, 0.38, 0.44, 0.54)
 
         self._text(content, f"电阻 {unit_label}", plot_x, y + height - 16, 10)
-        self._text(content, "时间 s", x + width - 50, y + 12, 10)
+        self._text(content, "时间", x + width - 42, y + 12, 10)
 
         if len(points) < 2:
             self._text(content, "暂无曲线数据", x + width / 2 - 35, y + height / 2, 12, 0.38, 0.44, 0.54)
@@ -412,14 +423,20 @@ class ResistanceApp(tk.Tk):
         self.raw_samples = []
         self.start_time = None
         self.raw_start_time = None
+        self.last_recorded_time = None
         self.raw_bytes = 0
         self.raw_records = 0
+        self.autosave_path = None
+        self.autosave_handle = None
+        self.autosave_writer = None
         self.event_queue = queue.Queue()
         self.serial_worker = SerialWorker(self.event_queue)
         self.simulation_job = None
         self.auto_stop_job = None
         self.auto_stopped = False
         self.experiment_time_var = tk.StringVar(value=time.strftime("%Y-%m-%d %H:%M"))
+        self.sample_interval_var = tk.StringVar(value="60")
+        self.x_axis_hours_var = tk.StringVar(value="6")
         self.plant_id_var = tk.StringVar(value="绿萝01")
         self.temperature_var = tk.StringVar()
         self.humidity_var = tk.StringVar()
@@ -480,7 +497,7 @@ class ResistanceApp(tk.Tk):
 
         ttk.Button(controls, text="模拟数据", command=self.toggle_simulation).pack(side="right", padx=(8, 0))
         ttk.Button(controls, text="清空", command=self.clear_data).pack(side="right")
-        ttk.Button(controls, text="导出原始CSV", command=self.export_raw_csv).pack(side="right", padx=(0, 8))
+        ttk.Button(controls, text="导出记录CSV", command=self.export_raw_csv).pack(side="right", padx=(0, 8))
         ttk.Button(controls, text="导出PDF", command=self.export_pdf).pack(side="right", padx=(0, 8))
         ttk.Button(controls, text="重置缩放", command=self.reset_zoom).pack(side="right", padx=(0, 8))
         ttk.Button(controls, text="放大", command=self.zoom_in).pack(side="right", padx=(0, 6))
@@ -492,11 +509,20 @@ class ResistanceApp(tk.Tk):
         ttk.Label(experiment, text="实验时间").pack(side="left")
         ttk.Entry(experiment, textvariable=self.experiment_time_var, width=18).pack(side="left", padx=(6, 12))
 
-        ttk.Label(experiment, text="测试时长(s)").pack(side="left")
-        self.window_var = tk.StringVar(value="120")
+        ttk.Label(experiment, text="测试时长(h)").pack(side="left")
+        self.window_var = tk.StringVar(value="24")
         window_entry = ttk.Entry(experiment, textvariable=self.window_var, width=8)
         window_entry.pack(side="left", padx=(6, 12))
         window_entry.bind("<Return>", lambda _event: self.update_duration_setting())
+
+        ttk.Label(experiment, text="记录间隔(s)").pack(side="left")
+        interval_entry = ttk.Entry(experiment, textvariable=self.sample_interval_var, width=7)
+        interval_entry.pack(side="left", padx=(6, 12))
+
+        ttk.Label(experiment, text="横轴范围(h)").pack(side="left")
+        x_axis_entry = ttk.Entry(experiment, textvariable=self.x_axis_hours_var, width=7)
+        x_axis_entry.pack(side="left", padx=(6, 12))
+        x_axis_entry.bind("<Return>", lambda _event: self.reset_zoom())
 
         ttk.Label(experiment, text="植物编号").pack(side="left")
         ttk.Entry(experiment, textvariable=self.plant_id_var, width=10).pack(side="left", padx=(6, 12))
@@ -539,7 +565,8 @@ class ResistanceApp(tk.Tk):
         self.max_var = tk.StringVar(value="最大：--")
         self.bytes_var = tk.StringVar(value="收到字节：0")
         self.parsed_var = tk.StringVar(value="解析成功：0")
-        self.raw_var = tk.StringVar(value="原始记录：0")
+        self.raw_var = tk.StringVar(value="保存记录：0")
+        self.autosave_var = tk.StringVar(value="自动CSV：未开始")
 
         for variable in (
             self.status_var,
@@ -550,6 +577,7 @@ class ResistanceApp(tk.Tk):
             self.bytes_var,
             self.parsed_var,
             self.raw_var,
+            self.autosave_var,
         ):
             ttk.Label(status, textvariable=variable).pack(side="left", padx=(0, 16))
 
@@ -614,7 +642,12 @@ class ResistanceApp(tk.Tk):
     def disconnect_serial(self):
         self.serial_worker.stop()
         self.cancel_auto_stop()
-        self.status_var.set("未连接")
+        saved_path = self.autosave_path
+        self.close_autosave_file()
+        if saved_path:
+            self.status_var.set(f"未连接，CSV 已保存：{os.path.basename(saved_path)}")
+        else:
+            self.status_var.set("未连接")
         self.connect_button.configure(state="normal")
         self.disconnect_button.configure(state="disabled")
 
@@ -640,33 +673,52 @@ class ResistanceApp(tk.Tk):
         if self.auto_stopped:
             return
         resistance = ResistanceParser.parse(line)
-        self.record_raw_sample(line, resistance)
         if resistance is None:
             self.append_log(f"未解析 <= {show_control_characters(line)}")
             self.update_stats()
             return
 
-        self.append_data_point(resistance, line)
+        now = time.monotonic()
+        if not self.should_record_sample(now):
+            return
+        if self.start_time is not None and now - self.start_time > self.measurement_duration():
+            self.auto_stop_measurement()
+            return
+        self.record_raw_sample(line, resistance, now)
+        self.append_data_point(resistance, line, now)
 
-    def record_raw_sample(self, raw_line, parsed_resistance):
-        now_monotonic = time.monotonic()
+    def should_record_sample(self, now_monotonic):
+        interval = self.sample_interval()
+        if interval <= 0:
+            return True
+        if self.last_recorded_time is None:
+            return True
+        return now_monotonic - self.last_recorded_time >= interval
+
+    def record_raw_sample(self, raw_line, parsed_resistance, now_monotonic=None):
+        if now_monotonic is None:
+            now_monotonic = time.monotonic()
         if self.raw_start_time is None:
             self.raw_start_time = now_monotonic
+        self.last_recorded_time = now_monotonic
         self.raw_records += 1
-        self.raw_samples.append(
-            (
-                self.raw_records,
-                time.time(),
-                now_monotonic - self.raw_start_time,
-                raw_line,
-                parsed_resistance,
-            )
+        sample = (
+            self.raw_records,
+            time.time(),
+            now_monotonic - self.raw_start_time,
+            raw_line,
+            parsed_resistance,
         )
+        self.raw_samples.append(sample)
+        if len(self.raw_samples) > 20_000:
+            self.raw_samples = self.raw_samples[-20_000:]
+        self.write_autosave_sample(sample)
 
-    def append_data_point(self, resistance, raw_line):
+    def append_data_point(self, resistance, raw_line, now=None):
         if self.auto_stopped:
             return
-        now = time.monotonic()
+        if now is None:
+            now = time.monotonic()
         if self.start_time is None:
             self.start_time = now
             self.schedule_auto_stop()
@@ -697,7 +749,7 @@ class ResistanceApp(tk.Tk):
         visible = self.visible_points()
         self.bytes_var.set(f"收到字节：{self.raw_bytes}")
         self.parsed_var.set(f"解析成功：{len(self.data_points)}")
-        self.raw_var.set(f"原始记录：{self.raw_records}")
+        self.raw_var.set(f"保存记录：{self.raw_records}")
 
         if not visible:
             self.current_var.set("当前：--")
@@ -730,18 +782,22 @@ class ResistanceApp(tk.Tk):
 
         visible = self.visible_points()
         latest = visible[-1][0] if visible else 0
-        window_seconds = self.measurement_duration()
-        full_max_x = max(window_seconds, latest)
-        if self.zoom_factor <= 1:
-            self.pan_x_offset = 0.0
-            self.pan_y_offset = 0.0
-            min_x = 0
-            max_x = full_max_x
+        x_window = self.x_axis_window_seconds()
+        if x_window is None:
+            full_max_x = max(self.measurement_duration(), latest, 1)
+            base_span = full_max_x
         else:
-            x_span = max(1, full_max_x / self.zoom_factor)
-            self.pan_x_offset = max(0, min(self.pan_x_offset, max(0, full_max_x - x_span)))
-            max_x = full_max_x - self.pan_x_offset
-            min_x = max(0, max_x - x_span)
+            full_max_x = max(x_window, latest, 1)
+            base_span = min(x_window, full_max_x)
+
+        x_span = max(1, min(base_span / self.zoom_factor, full_max_x))
+        if x_span >= full_max_x:
+            self.pan_x_offset = 0.0
+        if self.zoom_factor <= 1:
+            self.pan_y_offset = 0.0
+        self.pan_x_offset = max(0, min(self.pan_x_offset, max(0, full_max_x - x_span)))
+        max_x = full_max_x - self.pan_x_offset
+        min_x = max(0, max_x - x_span)
 
         display_points = [point for point in visible if min_x <= point[0] <= max_x]
         range_points = display_points or visible
@@ -791,7 +847,7 @@ class ResistanceApp(tk.Tk):
             x = plot_x + ratio * plot_w
             canvas.create_line(x, plot_y, x, plot_y + plot_h, fill="#d9e1ed")
             seconds = min_x + ratio * (max_x - min_x)
-            canvas.create_text(x, plot_y + plot_h + 22, text=f"{trim_number(seconds)}s", fill="#617089", font=("Segoe UI", 9))
+            canvas.create_text(x, plot_y + plot_h + 22, text=format_time_axis(seconds), fill="#617089", font=("Segoe UI", 9))
 
         for value in y_tick_values(min_y, max_y, grid_step):
             ratio = (max_y - value) / max(max_y - min_y, 0.001)
@@ -801,7 +857,7 @@ class ResistanceApp(tk.Tk):
 
         canvas.create_line(plot_x, plot_y, plot_x, plot_y + plot_h, plot_x + plot_w, plot_y + plot_h, fill="#69758a")
         canvas.create_text(plot_x + 36, 14, text=f"电阻 {unit_label}", fill="#162033", font=("Segoe UI", 10, "bold"))
-        canvas.create_text(width - 58, height - 17, text="时间 s", fill="#162033", font=("Segoe UI", 10, "bold"))
+        canvas.create_text(width - 44, height - 17, text="时间", fill="#162033", font=("Segoe UI", 10, "bold"))
 
         self.plotted_points = []
         if len(display_points) < 2:
@@ -865,16 +921,21 @@ class ResistanceApp(tk.Tk):
         self.drag_start = (event.x, event.y) if in_plot else None
 
     def pan_chart(self, event):
-        if self.drag_start is None or self.zoom_factor <= 1 or not self.current_chart_view:
+        if self.drag_start is None or not self.current_chart_view:
             return
         last_x, last_y = self.drag_start
         dx = event.x - last_x
         dy = event.y - last_y
         view = self.current_chart_view
+        can_pan_x = (view["max_x"] - view["min_x"]) < view["full_max_x"] - 0.001
+        if not can_pan_x and self.zoom_factor <= 1:
+            return
         x_span = max(view["max_x"] - view["min_x"], 0.001)
         y_span = max(view["max_y"] - view["min_y"], 0.001)
-        self.pan_x_offset += (dx / max(view["plot_w"], 1)) * x_span
-        self.pan_y_offset += (dy / max(view["plot_h"], 1)) * y_span
+        if can_pan_x:
+            self.pan_x_offset += (dx / max(view["plot_w"], 1)) * x_span
+        if self.zoom_factor > 1:
+            self.pan_y_offset += (dy / max(view["plot_h"], 1)) * y_span
         self.clamp_pan()
         self.drag_start = (event.x, event.y)
         self.redraw_chart()
@@ -883,13 +944,20 @@ class ResistanceApp(tk.Tk):
         self.drag_start = None
 
     def clamp_pan(self):
-        if self.zoom_factor <= 1:
+        latest = self.data_points[-1][0] if self.data_points else 0
+        x_window = self.x_axis_window_seconds()
+        if x_window is None:
+            full_max_x = max(self.measurement_duration(), latest, 1)
+            base_span = full_max_x
+        else:
+            full_max_x = max(x_window, latest, 1)
+            base_span = min(x_window, full_max_x)
+        x_span = max(1, min(base_span / self.zoom_factor, full_max_x))
+        if x_span >= full_max_x:
             self.pan_x_offset = 0.0
-            self.pan_y_offset = 0.0
+            if self.zoom_factor <= 1:
+                self.pan_y_offset = 0.0
             return
-        latest = self.data_points[-1][0] if self.data_points else self.measurement_duration()
-        full_max_x = max(self.measurement_duration(), latest)
-        x_span = max(1, full_max_x / self.zoom_factor)
         self.pan_x_offset = max(0, min(self.pan_x_offset, max(0, full_max_x - x_span)))
 
     def show_point_tooltip(self, event):
@@ -909,7 +977,7 @@ class ResistanceApp(tk.Tk):
             return
 
         x, y, point_time, resistance, _raw_line = nearest
-        text = f"时间：{point_time:.2f} s\n电阻：{format_resistance(resistance, preferred='kohm')}"
+        text = f"时间：{format_time_axis(point_time)}\n电阻：{format_resistance(resistance, preferred='kohm')}"
         box_width = max(112, len(max(text.splitlines(), key=len)) * 8 + 18)
         box_height = 48
         box_x = event.x + 14
@@ -958,8 +1026,15 @@ class ResistanceApp(tk.Tk):
         noise = random.uniform(-12, 12)
         value = max(0.1, baseline + ripple + noise)
         raw_line = f"R={trim_number(value)} ohm"
-        self.record_raw_sample(raw_line, value)
-        self.append_data_point(value, raw_line)
+        now = time.monotonic()
+        if not self.should_record_sample(now):
+            self.simulation_job = self.after(350, lambda: self._simulate_tick(phase))
+            return
+        if self.start_time is not None and now - self.start_time > self.measurement_duration():
+            self.auto_stop_measurement()
+            return
+        self.record_raw_sample(raw_line, value, now)
+        self.append_data_point(value, raw_line, now)
         if self.auto_stopped:
             return
         self.simulation_job = self.after(350, lambda: self._simulate_tick(phase))
@@ -974,8 +1049,12 @@ class ResistanceApp(tk.Tk):
         self.raw_samples.clear()
         self.start_time = None
         self.raw_start_time = None
+        self.last_recorded_time = None
         self.auto_stopped = False
         self.cancel_auto_stop()
+        self.close_autosave_file()
+        self.autosave_path = None
+        self.autosave_var.set("自动CSV：未开始")
         self.raw_bytes = 0
         self.raw_records = 0
         self.log.delete("1.0", "end")
@@ -988,10 +1067,30 @@ class ResistanceApp(tk.Tk):
 
     def measurement_duration(self):
         try:
-            seconds = float(self.window_var.get().strip())
+            hours = float(self.window_var.get().strip())
         except ValueError:
-            seconds = 120
+            hours = 24
+        seconds = hours * 3600
         return max(5, min(86400, seconds))
+
+    def sample_interval(self):
+        try:
+            seconds = float(self.sample_interval_var.get().strip())
+        except ValueError:
+            seconds = 60
+        return max(0, seconds)
+
+    def x_axis_window_seconds(self):
+        cleaned = self.x_axis_hours_var.get().strip()
+        if not cleaned:
+            return None
+        try:
+            hours = float(cleaned)
+        except ValueError:
+            return None
+        if hours <= 0:
+            return None
+        return min(self.measurement_duration(), max(5, hours * 3600))
 
     def schedule_auto_stop(self):
         self.cancel_auto_stop()
@@ -1018,9 +1117,14 @@ class ResistanceApp(tk.Tk):
         self.cancel_auto_stop()
         self.stop_simulation()
         self.serial_worker.stop()
+        saved_path = self.autosave_path
+        self.close_autosave_file()
         self.connect_button.configure(state="normal")
         self.disconnect_button.configure(state="disabled")
-        self.status_var.set("已到测试时长，自动停止")
+        if saved_path:
+            self.status_var.set(f"已到测试时长，CSV 已保存：{os.path.basename(saved_path)}")
+        else:
+            self.status_var.set("已到测试时长，自动停止")
         self.append_log("已到测试时长，自动停止。")
         self.update_stats()
         self.redraw_chart()
@@ -1033,6 +1137,56 @@ class ResistanceApp(tk.Tk):
             self.log.delete("1.0", "end")
             self.log.insert("end", "\n".join(lines[-220:]) + "\n")
         self.log.see("end")
+
+    def ensure_autosave_file(self):
+        if self.autosave_handle is not None:
+            return
+
+        output_dir = os.path.join(os.getcwd(), "output")
+        os.makedirs(output_dir, exist_ok=True)
+        self.autosave_path = os.path.join(output_dir, f"植物阻抗自动记录_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+        self.autosave_handle = open(self.autosave_path, "w", encoding="utf-8-sig", newline="")
+        self.autosave_writer = csv.writer(self.autosave_handle)
+        self.autosave_writer.writerow(
+            [
+                "index",
+                "received_at",
+                "elapsed_s",
+                "parsed_resistance_ohm",
+                "parsed_resistance_kohm",
+                "raw_line",
+            ]
+        )
+        self.autosave_handle.flush()
+        self.autosave_var.set(f"自动CSV：{os.path.basename(self.autosave_path)}")
+
+    def write_autosave_sample(self, sample):
+        try:
+            self.ensure_autosave_file()
+            index, received_at, elapsed, raw_line, parsed_resistance = sample
+            self.autosave_writer.writerow(
+                [
+                    index,
+                    time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(received_at)),
+                    f"{elapsed:.6f}",
+                    "" if parsed_resistance is None else f"{parsed_resistance:.6f}",
+                    "" if parsed_resistance is None else f"{parsed_resistance / 1000:.6f}",
+                    raw_line,
+                ]
+            )
+            self.autosave_handle.flush()
+        except Exception as exc:
+            self.status_var.set(f"自动CSV写入失败：{exc}")
+
+    def close_autosave_file(self):
+        if self.autosave_handle is None:
+            return
+        try:
+            self.autosave_handle.flush()
+            self.autosave_handle.close()
+        finally:
+            self.autosave_handle = None
+            self.autosave_writer = None
 
     def export_pdf(self):
         if not self.data_points:
@@ -1058,7 +1212,7 @@ class ResistanceApp(tk.Tk):
                 "y_grid_step_value": self.y_grid_step(),
                 "metadata": {
                     "experiment_time": value_or_dash(self.experiment_time_var.get()),
-                    "duration": f"{trim_number(window_seconds)} 秒",
+                    "duration": f"{trim_number(window_seconds / 3600)} 小时    记录间隔：{trim_number(self.sample_interval())} 秒",
                     "plant_id": value_or_dash(self.plant_id_var.get()),
                     "temperature": value_or_dash(self.temperature_var.get()),
                     "humidity": value_or_dash(self.humidity_var.get()),
@@ -1074,13 +1228,13 @@ class ResistanceApp(tk.Tk):
             messagebox.showerror("导出失败", str(exc))
 
     def export_raw_csv(self):
-        if not self.raw_samples:
-            messagebox.showinfo("没有可导出的原始数据", "请先连接串口并接收到芯片数据。")
+        if not self.raw_samples and not self.autosave_path:
+            messagebox.showinfo("没有可导出的记录数据", "请先连接串口并记录到电阻数据。")
             return
 
-        default_name = f"植物阻抗原始数据_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+        default_name = f"植物阻抗记录数据_{time.strftime('%Y%m%d_%H%M%S')}.csv"
         path = filedialog.asksaveasfilename(
-            title="导出原始数据 CSV",
+            title="导出记录数据 CSV",
             defaultextension=".csv",
             initialfile=default_name,
             filetypes=(("CSV 文件", "*.csv"), ("所有文件", "*.*")),
@@ -1089,36 +1243,43 @@ class ResistanceApp(tk.Tk):
             return
 
         try:
-            with open(path, "w", encoding="utf-8-sig", newline="") as handle:
-                writer = csv.writer(handle)
-                writer.writerow(
-                    [
-                        "index",
-                        "received_at",
-                        "elapsed_s",
-                        "parsed_resistance_ohm",
-                        "parsed_resistance_kohm",
-                        "raw_line",
-                    ]
-                )
-                for index, received_at, elapsed, raw_line, parsed_resistance in self.raw_samples:
+            if self.autosave_path and os.path.exists(self.autosave_path):
+                if self.autosave_handle is not None:
+                    self.autosave_handle.flush()
+                if os.path.abspath(self.autosave_path) != os.path.abspath(path):
+                    shutil.copyfile(self.autosave_path, path)
+            else:
+                with open(path, "w", encoding="utf-8-sig", newline="") as handle:
+                    writer = csv.writer(handle)
                     writer.writerow(
                         [
-                            index,
-                            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(received_at)),
-                            f"{elapsed:.6f}",
-                            "" if parsed_resistance is None else f"{parsed_resistance:.6f}",
-                            "" if parsed_resistance is None else f"{parsed_resistance / 1000:.6f}",
-                            raw_line,
+                            "index",
+                            "received_at",
+                            "elapsed_s",
+                            "parsed_resistance_ohm",
+                            "parsed_resistance_kohm",
+                            "raw_line",
                         ]
                     )
-            self.status_var.set(f"原始数据已导出：{path}")
+                    for index, received_at, elapsed, raw_line, parsed_resistance in self.raw_samples:
+                        writer.writerow(
+                            [
+                                index,
+                                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(received_at)),
+                                f"{elapsed:.6f}",
+                                "" if parsed_resistance is None else f"{parsed_resistance:.6f}",
+                                "" if parsed_resistance is None else f"{parsed_resistance / 1000:.6f}",
+                                raw_line,
+                            ]
+                        )
+            self.status_var.set(f"记录数据已导出：{path}")
         except Exception as exc:
             messagebox.showerror("导出失败", str(exc))
 
     def close(self):
         self.stop_simulation()
         self.serial_worker.stop()
+        self.close_autosave_file()
         self.destroy()
 
 
