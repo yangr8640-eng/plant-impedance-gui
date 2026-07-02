@@ -244,6 +244,14 @@ final class GraphView: NSView {
     var windowSeconds: TimeInterval = 120 {
         didSet { needsDisplay = true }
     }
+    var displayWindowSeconds: TimeInterval? {
+        didSet {
+            panXOffset = 0
+            panYOffset = 0
+            clampHorizontalPan()
+            needsDisplay = true
+        }
+    }
     var autoScale = true {
         didSet { needsDisplay = true }
     }
@@ -262,11 +270,14 @@ final class GraphView: NSView {
     var zoomScale: Double = 1 {
         didSet {
             zoomScale = min(max(zoomScale, 1), 16)
-            if zoomScale <= 1 {
+            if zoomScale <= 1, displayWindowSeconds == nil {
                 panXOffset = 0
                 panYOffset = 0
             } else {
                 clampHorizontalPan()
+                if zoomScale <= 1 {
+                    panYOffset = 0
+                }
             }
             needsDisplay = true
         }
@@ -392,10 +403,10 @@ final class GraphView: NSView {
     }
 
     private func chartRange(for visible: [DataPoint]) -> (minX: Double, maxX: Double, minY: Double, maxY: Double) {
-        let latest = visible.last?.time ?? windowSeconds
-        let fullMaxX = max(windowSeconds, latest)
-        let xSpan = max(1, fullMaxX / zoomScale)
-        if zoomScale <= 1 {
+        let latest = visible.last?.time ?? 0
+        let fullMaxX = fullMaxX(latest: latest)
+        let xSpan = currentXSpan(fullMaxX: fullMaxX)
+        if zoomScale <= 1, displayWindowSeconds == nil {
             panXOffset = 0
             panYOffset = 0
         }
@@ -478,7 +489,7 @@ final class GraphView: NSView {
             grid.move(to: NSPoint(x: x, y: plot.minY))
             grid.line(to: NSPoint(x: x, y: plot.maxY))
             let seconds = range.minX + Double(ratio) * (range.maxX - range.minX)
-            drawLabel("\(trim(seconds))s", at: NSPoint(x: x - 14, y: plot.maxY + 14))
+            drawLabel(formatTimeAxisLabel(seconds), at: NSPoint(x: x - 14, y: plot.maxY + 14))
         }
 
         for value in yTickValues(for: range) {
@@ -500,7 +511,7 @@ final class GraphView: NSView {
         axis.stroke()
 
         drawTitle("电阻 \(scale.label)", at: NSPoint(x: plot.minX, y: 12))
-        drawTitle("时间 s", at: NSPoint(x: plot.maxX - 46, y: bounds.maxY - 24))
+        drawTitle("时间", at: NSPoint(x: plot.maxX - 34, y: bounds.maxY - 24))
     }
 
     private func drawEmptyMessage(in rect: NSRect, hasData: Bool = false) {
@@ -562,31 +573,59 @@ final class GraphView: NSView {
     }
 
     private func panChartBy(dx: CGFloat, dy: CGFloat) {
-        guard zoomScale > 1 else {
+        let range = chartRange(for: visiblePoints())
+        let latest = points.last?.time ?? 0
+        let fullMaxX = fullMaxX(latest: latest)
+        let canPanX = (range.maxX - range.minX) < fullMaxX - 0.001
+        guard zoomScale > 1 || canPanX else {
             return
         }
         let plot = plotRect()
         guard plot.width > 0, plot.height > 0 else {
             return
         }
-        let range = chartRange(for: visiblePoints())
-        panXOffset += Double(dx / plot.width) * max(range.maxX - range.minX, 0.001)
-        panYOffset += Double(dy / plot.height) * max(range.maxY - range.minY, 0.001)
+        if canPanX {
+            panXOffset += Double(dx / plot.width) * max(range.maxX - range.minX, 0.001)
+        }
+        if zoomScale > 1 {
+            panYOffset += Double(dy / plot.height) * max(range.maxY - range.minY, 0.001)
+        }
         clampHorizontalPan()
         needsDisplay = true
     }
 
     private func clampHorizontalPan() {
-        guard zoomScale > 1 else {
+        let latest = points.last?.time ?? 0
+        let fullMaxX = fullMaxX(latest: latest)
+        let xSpan = currentXSpan(fullMaxX: fullMaxX)
+        guard xSpan < fullMaxX else {
             panXOffset = 0
-            panYOffset = 0
+            if zoomScale <= 1 {
+                panYOffset = 0
+            }
             return
         }
-        let latest = points.last?.time ?? windowSeconds
-        let fullMaxX = max(windowSeconds, latest)
-        let xSpan = max(1, fullMaxX / zoomScale)
         let maxPanOffset = max(0, fullMaxX - xSpan)
         panXOffset = min(max(panXOffset, 0), maxPanOffset)
+    }
+
+    func resetViewport() {
+        zoomScale = 1
+        panXOffset = 0
+        panYOffset = 0
+        needsDisplay = true
+    }
+
+    private func fullMaxX(latest: Double) -> Double {
+        if let displayWindowSeconds {
+            return max(displayWindowSeconds, latest, 1)
+        }
+        return max(windowSeconds, latest, 1)
+    }
+
+    private func currentXSpan(fullMaxX: Double) -> Double {
+        let baseSpan = displayWindowSeconds.map { min(max($0, 1), fullMaxX) } ?? fullMaxX
+        return max(1, min(baseSpan / zoomScale, fullMaxX))
     }
 
     private func drawHoverTooltip(in plot: NSRect, range: (minX: Double, maxX: Double, minY: Double, maxY: Double)) {
@@ -598,7 +637,7 @@ final class GraphView: NSView {
         NSColor(calibratedRed: 0.9, green: 0.45, blue: 0.25, alpha: 1).setFill()
         NSBezierPath(ovalIn: NSRect(x: pointOnChart.x - 5, y: pointOnChart.y - 5, width: 10, height: 10)).fill()
 
-        let text = "时间：\(String(format: "%.2f", point.time)) s\n电阻：\(formatResistance(point.rawValue, preferredUnit: "kohm"))"
+        let text = "时间：\(formatTimeAxisLabel(point.time))\n电阻：\(formatResistance(point.rawValue, preferredUnit: "kohm"))"
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 12),
             .foregroundColor: NSColor.labelColor
@@ -675,7 +714,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let simulateButton = NSButton(title: "模拟数据", target: nil, action: nil)
     private let clearButton = NSButton(title: "清空", target: nil, action: nil)
     private let exportPDFButton = NSButton(title: "导出PDF", target: nil, action: nil)
-    private let exportRawCSVButton = NSButton(title: "导出原始CSV", target: nil, action: nil)
+    private let exportRawCSVButton = NSButton(title: "导出记录CSV", target: nil, action: nil)
     private let zoomInButton = NSButton(title: "放大", target: nil, action: nil)
     private let zoomOutButton = NSButton(title: "缩小", target: nil, action: nil)
     private let resetZoomButton = NSButton(title: "重置缩放", target: nil, action: nil)
@@ -686,8 +725,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let maxLabel = NSTextField(labelWithString: "最大：--")
     private let bytesLabel = NSTextField(labelWithString: "收到字节：0")
     private let parsedLabel = NSTextField(labelWithString: "解析成功：0")
-    private let rawLabel = NSTextField(labelWithString: "原始记录：0")
-    private let windowSecondsField = NSTextField(string: "120")
+    private let rawLabel = NSTextField(labelWithString: "保存记录：0")
+    private let autosaveLabel = NSTextField(labelWithString: "自动CSV：未开始")
+    private let windowSecondsField = NSTextField(string: "24")
+    private let sampleIntervalField = NSTextField(string: "60")
+    private let xAxisHoursField = NSTextField(string: "6")
     private let yGridStepField = NSTextField(string: "")
     private let experimentTimeField = NSTextField(string: "")
     private let plantIdField = NSTextField(string: "绿萝01")
@@ -702,10 +744,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var rawSamples: [RawSample] = []
     private var startDate: Date?
     private var rawStartDate: Date?
+    private var lastRecordedAt: Date?
     private var rawBytes = 0
     private var rawRecords = 0
     private var simulationTimer: Timer?
     private var measurementStopTimer: Timer?
+    private var autosaveURL: URL?
+    private var autosaveHandle: FileHandle?
     private var hasAutoStopped = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -723,6 +768,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         stopSimulation()
         cancelMeasurementStopTimer()
         serialReader.stop()
+        closeAutosaveFile()
     }
 
     private func buildWindow() {
@@ -828,10 +874,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         autoScaleButton.target = self
         autoScaleButton.action = #selector(updateGraphOptions)
 
-        windowSecondsField.placeholderString = "120"
+        windowSecondsField.placeholderString = "24"
         windowSecondsField.alignment = .right
         windowSecondsField.target = self
         windowSecondsField.action = #selector(updateGraphOptions)
+
+        sampleIntervalField.placeholderString = "60"
+        sampleIntervalField.alignment = .right
+        sampleIntervalField.target = self
+        sampleIntervalField.action = #selector(updateGraphOptions)
+
+        xAxisHoursField.placeholderString = "6"
+        xAxisHoursField.alignment = .right
+        xAxisHoursField.target = self
+        xAxisHoursField.action = #selector(updateGraphOptions)
 
         yGridStepField.placeholderString = "自动"
         yGridStepField.alignment = .right
@@ -886,9 +942,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         timingRow.addArrangedSubview(experimentTimeField)
         experimentTimeField.widthAnchor.constraint(equalToConstant: 142).isActive = true
 
-        timingRow.addArrangedSubview(NSTextField(labelWithString: "测试时长(s)"))
+        timingRow.addArrangedSubview(NSTextField(labelWithString: "测试时长(h)"))
         timingRow.addArrangedSubview(windowSecondsField)
         windowSecondsField.widthAnchor.constraint(equalToConstant: 76).isActive = true
+
+        timingRow.addArrangedSubview(NSTextField(labelWithString: "记录间隔(s)"))
+        timingRow.addArrangedSubview(sampleIntervalField)
+        sampleIntervalField.widthAnchor.constraint(equalToConstant: 64).isActive = true
+
+        timingRow.addArrangedSubview(NSTextField(labelWithString: "横轴范围(h)"))
+        timingRow.addArrangedSubview(xAxisHoursField)
+        xAxisHoursField.widthAnchor.constraint(equalToConstant: 58).isActive = true
 
         timingRow.addArrangedSubview(NSTextField(labelWithString: "植物编号"))
         timingRow.addArrangedSubview(plantIdField)
@@ -939,7 +1003,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             makeSeparator(),
             bytesLabel,
             parsedLabel,
-            rawLabel
+            rawLabel,
+            autosaveLabel
         ])
         stack.orientation = .horizontal
         stack.spacing = 12
@@ -1013,7 +1078,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func disconnectSerial() {
         serialReader.stop()
         cancelMeasurementStopTimer()
-        setStatus("未连接", connected: false)
+        let savedFile = autosaveURL?.lastPathComponent
+        closeAutosaveFile()
+        if let savedFile {
+            setStatus("未连接，CSV 已保存：\(savedFile)", connected: false)
+        } else {
+            setStatus("未连接", connected: false)
+        }
         connectButton.isEnabled = portPopup.isEnabled
         disconnectButton.isEnabled = false
     }
@@ -1023,20 +1094,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         let resistance = ResistanceParser.parse(line)
-        appendRawSample(rawLine: line, parsedResistance: resistance)
         guard let resistance else {
             appendLog("未解析 <= \(showControlCharacters(line))")
             updateStats()
             return
         }
-        appendDataPoint(resistance: resistance, rawLine: line)
+        let now = Date()
+        guard shouldRecordSample(at: now) else {
+            return
+        }
+        if let startDate, now.timeIntervalSince(startDate) > measurementDurationSeconds() {
+            autoStopMeasurement()
+            return
+        }
+        appendRawSample(rawLine: line, parsedResistance: resistance, receivedAt: now)
+        appendDataPoint(resistance: resistance, rawLine: line, receivedAt: now)
     }
 
-    private func appendDataPoint(resistance: Double, rawLine: String) {
+    private func appendDataPoint(resistance: Double, rawLine: String, receivedAt now: Date = Date()) {
         guard !hasAutoStopped else {
             return
         }
-        let now = Date()
         if startDate == nil {
             startDate = now
             scheduleMeasurementStopTimer()
@@ -1084,25 +1162,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let noise = Double.random(in: -12...12)
             let value = max(0.1, baseline + ripple + noise)
             let rawLine = "R=\(trim(value)) ohm"
-            self.appendRawSample(rawLine: rawLine, parsedResistance: value)
-            self.appendDataPoint(resistance: value, rawLine: rawLine)
+            let now = Date()
+            guard self.shouldRecordSample(at: now) else {
+                return
+            }
+            if let startDate = self.startDate, now.timeIntervalSince(startDate) > self.measurementDurationSeconds() {
+                self.autoStopMeasurement()
+                return
+            }
+            self.appendRawSample(rawLine: rawLine, parsedResistance: value, receivedAt: now)
+            self.appendDataPoint(resistance: value, rawLine: rawLine, receivedAt: now)
         }
     }
 
-    private func appendRawSample(rawLine: String, parsedResistance: Double?) {
-        let now = Date()
+    private func shouldRecordSample(at now: Date) -> Bool {
+        let interval = sampleIntervalSeconds()
+        guard interval > 0 else {
+            return true
+        }
+        guard let lastRecordedAt else {
+            return true
+        }
+        return now.timeIntervalSince(lastRecordedAt) >= interval
+    }
+
+    private func appendRawSample(rawLine: String, parsedResistance: Double?, receivedAt now: Date = Date()) {
         if rawStartDate == nil {
             rawStartDate = now
         }
+        lastRecordedAt = now
         rawRecords += 1
         let elapsed = now.timeIntervalSince(rawStartDate!)
-        rawSamples.append(RawSample(
+        let sample = RawSample(
             index: rawRecords,
             receivedAt: now,
             elapsed: elapsed,
             rawLine: rawLine,
             parsedResistance: parsedResistance
-        ))
+        )
+        rawSamples.append(sample)
+        if rawSamples.count > 20_000 {
+            rawSamples.removeFirst(rawSamples.count - 20_000)
+        }
+        appendAutosaveSample(sample)
     }
 
     private func stopSimulation() {
@@ -1116,8 +1218,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rawSamples.removeAll()
         startDate = nil
         rawStartDate = nil
+        lastRecordedAt = nil
         hasAutoStopped = false
         cancelMeasurementStopTimer()
+        closeAutosaveFile()
+        autosaveURL = nil
+        autosaveLabel.stringValue = "自动CSV：未开始"
         rawBytes = 0
         rawRecords = 0
         graphView.points = []
@@ -1139,11 +1245,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func resetGraphZoom() {
-        graphView.zoomScale = 1
+        graphView.resetViewport()
     }
 
     private func applyGraphOptions() {
         graphView.windowSeconds = measurementDurationSeconds()
+        let xWindow = xAxisWindowSeconds()
+        if graphView.displayWindowSeconds != xWindow {
+            graphView.displayWindowSeconds = xWindow
+        }
         graphView.autoScale = autoScaleButton.state == .on
         let gridStep = Double(yGridStepField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
         graphView.yGridStep = gridStep > 0 ? gridStep : nil
@@ -1153,7 +1263,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         applyGraphOptions()
         let visible = visiblePoints()
         parsedLabel.stringValue = "解析成功：\(dataPoints.count)"
-        rawLabel.stringValue = "原始记录：\(rawRecords)"
+        rawLabel.stringValue = "保存记录：\(rawRecords)"
         bytesLabel.stringValue = "收到字节：\(rawBytes)"
 
         guard !visible.isEmpty else {
@@ -1183,8 +1293,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func measurementDurationSeconds() -> TimeInterval {
-        let seconds = Double(windowSecondsField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 120
+        let hours = Double(windowSecondsField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 24
+        let seconds = hours * 3_600
         return max(5, min(86_400, seconds))
+    }
+
+    private func sampleIntervalSeconds() -> TimeInterval {
+        let seconds = Double(sampleIntervalField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 60
+        return max(0, seconds)
+    }
+
+    private func xAxisWindowSeconds() -> TimeInterval? {
+        let trimmed = xAxisHoursField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let hours = Double(trimmed), hours > 0 else {
+            return nil
+        }
+        return min(measurementDurationSeconds(), max(5, hours * 3_600))
     }
 
     private func scheduleMeasurementStopTimer() {
@@ -1218,9 +1342,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         cancelMeasurementStopTimer()
         serialReader.stop()
         stopSimulation()
+        let savedFile = autosaveURL?.lastPathComponent
+        closeAutosaveFile()
         connectButton.isEnabled = portPopup.isEnabled
         disconnectButton.isEnabled = false
-        setStatus("已到测试时长，自动停止", connected: false)
+        if let savedFile {
+            setStatus("已到测试时长，CSV 已保存：\(savedFile)", connected: false)
+        } else {
+            setStatus("已到测试时长，自动停止", connected: false)
+        }
         appendLog("已到测试时长，自动停止。")
         updateStats()
     }
@@ -1240,6 +1370,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             logView.string = lines.suffix(220).joined(separator: "\n")
         }
         logView.scrollRangeToVisible(NSRange(location: logView.string.count, length: 0))
+    }
+
+    private func appendAutosaveSample(_ sample: RawSample) {
+        do {
+            try ensureAutosaveFile()
+            guard let handle = autosaveHandle else {
+                return
+            }
+            let formatter = DateFormatter()
+            formatter.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
+            let parsedOhm = sample.parsedResistance.map { csvNumber($0) } ?? ""
+            let parsedKohm = sample.parsedResistance.map { csvNumber($0 / 1_000) } ?? ""
+            let fields = [
+                String(sample.index),
+                formatter.string(from: sample.receivedAt),
+                csvNumber(sample.elapsed),
+                parsedOhm,
+                parsedKohm,
+                sample.rawLine
+            ]
+            let row = fields.map(csvEscape).joined(separator: ",") + "\n"
+            if let data = row.data(using: .utf8) {
+                handle.write(data)
+                handle.synchronizeFile()
+            }
+        } catch {
+            setStatus("自动CSV写入失败：\(error.localizedDescription)", connected: false)
+        }
+    }
+
+    private func ensureAutosaveFile() throws {
+        if autosaveHandle != nil {
+            return
+        }
+
+        let outputDirectory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("output", isDirectory: true)
+        try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+        let url = outputDirectory.appendingPathComponent("植物阻抗自动记录_\(fileDateStamp()).csv")
+        let header = "\u{FEFF}index,received_at,elapsed_s,parsed_resistance_ohm,parsed_resistance_kohm,raw_line\n"
+        try header.write(to: url, atomically: true, encoding: .utf8)
+        autosaveURL = url
+        autosaveHandle = try FileHandle(forWritingTo: url)
+        autosaveHandle?.seekToEndOfFile()
+        autosaveLabel.stringValue = "自动CSV：\(url.lastPathComponent)"
+    }
+
+    private func closeAutosaveFile() {
+        autosaveHandle?.synchronizeFile()
+        autosaveHandle?.closeFile()
+        autosaveHandle = nil
     }
 
     @objc private func exportPDF() {
@@ -1267,14 +1448,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func exportRawCSV() {
-        guard !rawSamples.isEmpty else {
-            showAlert(title: "没有可导出的原始数据", message: "请先连接串口并接收到芯片数据。")
+        guard !rawSamples.isEmpty || autosaveURL != nil else {
+            showAlert(title: "没有可导出的记录数据", message: "请先连接串口并记录到电阻数据。")
             return
         }
 
         let panel = NSSavePanel()
-        panel.title = "导出原始数据 CSV"
-        panel.nameFieldStringValue = "植物阻抗原始数据_\(fileDateStamp()).csv"
+        panel.title = "导出记录数据 CSV"
+        panel.nameFieldStringValue = "植物阻抗记录数据_\(fileDateStamp()).csv"
         if let csvType = UTType(filenameExtension: "csv") {
             panel.allowedContentTypes = [csvType]
         }
@@ -1285,11 +1466,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         do {
-            try writeRawCSV(to: url)
-            setStatus("原始数据已导出：\(url.lastPathComponent)", connected: true)
+            try exportCompleteRawCSV(to: url)
+            setStatus("记录数据已导出：\(url.lastPathComponent)", connected: true)
         } catch {
             showAlert(title: "导出失败", message: error.localizedDescription)
         }
+    }
+
+    private func exportCompleteRawCSV(to url: URL) throws {
+        if let autosaveURL, FileManager.default.fileExists(atPath: autosaveURL.path) {
+            autosaveHandle?.synchronizeFile()
+            if autosaveURL.standardizedFileURL != url.standardizedFileURL {
+                if FileManager.default.fileExists(atPath: url.path) {
+                    try FileManager.default.removeItem(at: url)
+                }
+                try FileManager.default.copyItem(at: autosaveURL, to: url)
+            }
+            return
+        }
+
+        try writeRawCSV(to: url)
     }
 
     private func writeRawCSV(to url: URL) throws {
@@ -1400,7 +1596,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let x = plot.minX + ratio * plot.width
             drawPDFLine(x1: x, y1: plot.minY, x2: x, y2: plot.maxY, color: NSColor(calibratedWhite: 0.72, alpha: 0.35), width: 0.6)
             let seconds = minX + Double(ratio) * (maxX - minX)
-            drawPDFText("\(trim(seconds))s", x: x - 10, y: plot.maxY + 13, size: 8, color: .secondaryLabelColor)
+            drawPDFText(formatTimeAxisLabel(seconds), x: x - 10, y: plot.maxY + 13, size: 8, color: .secondaryLabelColor)
         }
 
         for value in pdfYTickValues(minY: minY, maxY: maxY, step: gridStep) {
@@ -1411,7 +1607,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         drawPDFText("电阻 \(scale.label)", x: plot.minX, y: rect.minY + 8, size: 10, weight: .bold)
-        drawPDFText("时间 s", x: plot.maxX - 36, y: rect.maxY - 18, size: 10, weight: .bold)
+        drawPDFText("时间", x: plot.maxX - 28, y: rect.maxY - 18, size: 10, weight: .bold)
 
         guard visible.count >= 2 else {
             drawPDFText("暂无曲线数据", x: rect.midX - 34, y: rect.midY - 8, size: 12, color: .secondaryLabelColor)
@@ -1437,7 +1633,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func pdfExperimentLines() -> [String] {
         let seconds = measurementDurationSeconds()
         return [
-            "实验时间：\(valueOrDash(experimentTimeField.stringValue))    测试时长：\(trim(seconds)) 秒",
+            "实验时间：\(valueOrDash(experimentTimeField.stringValue))    测试时长：\(trim(seconds / 3_600)) 小时    记录间隔：\(trim(sampleIntervalSeconds())) 秒",
             "植物编号：\(valueOrDash(plantIdField.stringValue))    电极位置：\(electrodePopup.titleOfSelectedItem ?? "--")    土壤状态：\(soilPopup.titleOfSelectedItem ?? "--")",
             "温度：\(valueOrDash(temperatureField.stringValue)) °C    湿度：\(valueOrDash(humidityField.stringValue)) %    Y格差：\(customYGridStep().map { "\(trim($0)) Ω" } ?? "自动")"
         ]
@@ -1630,6 +1826,17 @@ func axisLabel(_ value: Double, step: Double?) -> String {
         decimals = 5
     }
     return String(format: "%.\(decimals)f", value).trimmingTrailingZeros()
+}
+
+func formatTimeAxisLabel(_ seconds: Double) -> String {
+    let absolute = abs(seconds)
+    if absolute >= 3_600 {
+        return "\(trim(seconds / 3_600))h"
+    }
+    if absolute >= 60 {
+        return "\(trim(seconds / 60))m"
+    }
+    return "\(trim(seconds))s"
 }
 
 func showControlCharacters(_ value: String) -> String {
