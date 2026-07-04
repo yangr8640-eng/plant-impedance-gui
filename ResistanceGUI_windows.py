@@ -8,6 +8,7 @@ import shutil
 import threading
 import time
 import tkinter as tk
+from collections import deque
 from tkinter import filedialog, messagebox, ttk
 
 try:
@@ -419,8 +420,8 @@ class ResistanceApp(tk.Tk):
         self.geometry("1180x820")
         self.minsize(960, 680)
 
-        self.data_points = []
-        self.raw_samples = []
+        self.data_points = deque(maxlen=20_000)
+        self.raw_samples = deque(maxlen=20_000)
         self.start_time = None
         self.raw_start_time = None
         self.last_recorded_time = None
@@ -434,6 +435,15 @@ class ResistanceApp(tk.Tk):
         self.simulation_job = None
         self.auto_stop_job = None
         self.auto_stopped = False
+        self.stats_dirty = True
+        self.chart_dirty = True
+        self.last_stats_update = 0.0
+        self.last_chart_redraw = 0.0
+        self.last_autosave_flush = 0.0
+        self.autosave_flush_interval = 1.0
+        self.log_line_count = 0
+        self.unparsed_lines_since_log = 0
+        self.last_unparsed_log_time = 0.0
         self.experiment_time_var = tk.StringVar(value=time.strftime("%Y-%m-%d %H:%M"))
         self.sample_interval_var = tk.StringVar(value="60")
         self.x_axis_hours_var = tk.StringVar(value="6")
@@ -652,40 +662,73 @@ class ResistanceApp(tk.Tk):
         self.disconnect_button.configure(state="disabled")
 
     def process_events(self):
-        while True:
+        processed = 0
+        deadline = time.monotonic() + 0.01
+
+        while processed < 500 and time.monotonic() < deadline:
             try:
                 event, payload = self.event_queue.get_nowait()
             except queue.Empty:
                 break
 
+            processed += 1
             if event == "bytes":
                 self.raw_bytes += payload
-                self.update_stats()
+                self.request_ui_update()
             elif event == "line":
                 self.handle_line(payload)
             elif event == "error":
                 self.status_var.set(f"读取失败：{payload}")
                 self.disconnect_serial()
 
-        self.after(16, self.process_events)
+        self.flush_pending_ui_updates()
+        delay = 1 if not self.event_queue.empty() else 16
+        self.after(delay, self.process_events)
 
     def handle_line(self, line):
         if self.auto_stopped:
             return
-        resistance = ResistanceParser.parse(line)
-        if resistance is None:
-            self.append_log(f"未解析 <= {show_control_characters(line)}")
-            self.update_stats()
-            return
-
         now = time.monotonic()
         if not self.should_record_sample(now):
             return
+        resistance = ResistanceParser.parse(line)
+        if resistance is None:
+            self.append_unparsed_log(line, now)
+            self.request_ui_update()
+            return
+
         if self.start_time is not None and now - self.start_time > self.measurement_duration():
             self.auto_stop_measurement()
             return
         self.record_raw_sample(line, resistance, now)
         self.append_data_point(resistance, line, now)
+
+    def request_ui_update(self, redraw=False):
+        self.stats_dirty = True
+        if redraw:
+            self.chart_dirty = True
+
+    def flush_pending_ui_updates(self, force=False):
+        now = time.monotonic()
+        if self.stats_dirty and (force or now - self.last_stats_update >= 0.2):
+            self.update_stats()
+            self.stats_dirty = False
+            self.last_stats_update = now
+        if self.chart_dirty and (force or now - self.last_chart_redraw >= 0.25):
+            self.redraw_chart()
+            self.chart_dirty = False
+            self.last_chart_redraw = now
+
+    def append_unparsed_log(self, line, now):
+        self.unparsed_lines_since_log += 1
+        if self.last_unparsed_log_time and now - self.last_unparsed_log_time < 1.0:
+            return
+
+        count = self.unparsed_lines_since_log
+        prefix = "未解析" if count == 1 else f"未解析 {count} 条，最近"
+        self.append_log(f"{prefix} <= {show_control_characters(line)}")
+        self.unparsed_lines_since_log = 0
+        self.last_unparsed_log_time = now
 
     def should_record_sample(self, now_monotonic):
         interval = self.sample_interval()
@@ -710,8 +753,6 @@ class ResistanceApp(tk.Tk):
             parsed_resistance,
         )
         self.raw_samples.append(sample)
-        if len(self.raw_samples) > 20_000:
-            self.raw_samples = self.raw_samples[-20_000:]
         self.write_autosave_sample(sample)
 
     def append_data_point(self, resistance, raw_line, now=None):
@@ -728,12 +769,9 @@ class ResistanceApp(tk.Tk):
             self.auto_stop_measurement()
             return
         self.data_points.append((elapsed, resistance, raw_line))
-        if len(self.data_points) > 20_000:
-            self.data_points = self.data_points[-20_000:]
 
         self.append_log(f"{format_resistance(resistance, preferred='kohm')} <= {show_control_characters(raw_line)}")
-        self.update_stats()
-        self.redraw_chart()
+        self.request_ui_update(redraw=True)
         if elapsed >= duration:
             self.auto_stop_measurement()
 
@@ -865,8 +903,9 @@ class ResistanceApp(tk.Tk):
             canvas.create_text(width / 2, height / 2, text=message, fill="#617089")
             return
 
+        plot_points = self.downsample_points(display_points, max(400, int(plot_w * 2)))
         coords = []
-        for point_time, resistance, raw_line in display_points:
+        for point_time, resistance, raw_line in plot_points:
             x = plot_x + ((point_time - min_x) / max(max_x - min_x, 0.001)) * plot_w
             y_ratio = (resistance - min_y) / max(max_y - min_y, 0.001)
             y = plot_y + (1 - y_ratio) * plot_h
@@ -875,6 +914,35 @@ class ResistanceApp(tk.Tk):
 
         canvas.create_line(*coords, fill="#147a72", width=3, smooth=True)
         canvas.create_oval(coords[-2] - 4, coords[-1] - 4, coords[-2] + 4, coords[-1] + 4, fill="#e5743f", outline="")
+
+    def downsample_points(self, points, max_points):
+        count = len(points)
+        if count <= max_points:
+            return points
+        if max_points < 3:
+            return [points[0], points[-1]]
+
+        bucket_count = max(1, (max_points - 2) // 2)
+        bucket_size = (count - 2) / bucket_count
+        sampled = [points[0]]
+        for bucket_index in range(bucket_count):
+            start = 1 + int(bucket_index * bucket_size)
+            end = 1 + int((bucket_index + 1) * bucket_size)
+            if bucket_index == bucket_count - 1:
+                end = count - 1
+            bucket = points[start:end]
+            if not bucket:
+                continue
+            min_point = min(bucket, key=lambda point: point[1])
+            max_point = max(bucket, key=lambda point: point[1])
+            if min_point is max_point:
+                sampled.append(min_point)
+            elif min_point[0] <= max_point[0]:
+                sampled.extend([min_point, max_point])
+            else:
+                sampled.extend([max_point, min_point])
+        sampled.append(points[-1])
+        return sampled
 
     def y_grid_step(self):
         try:
@@ -1058,6 +1126,7 @@ class ResistanceApp(tk.Tk):
         self.raw_bytes = 0
         self.raw_records = 0
         self.log.delete("1.0", "end")
+        self.log_line_count = 0
         self.update_stats()
         self.redraw_chart()
 
@@ -1132,10 +1201,11 @@ class ResistanceApp(tk.Tk):
     def append_log(self, line):
         stamp = time.strftime("%H:%M:%S")
         self.log.insert("end", f"[{stamp}] {line}\n")
-        lines = self.log.get("1.0", "end-1c").splitlines()
-        if len(lines) > 260:
-            self.log.delete("1.0", "end")
-            self.log.insert("end", "\n".join(lines[-220:]) + "\n")
+        self.log_line_count += 1
+        if self.log_line_count > 260:
+            remove_count = self.log_line_count - 220
+            self.log.delete("1.0", f"{remove_count + 1}.0")
+            self.log_line_count = 220
         self.log.see("end")
 
     def ensure_autosave_file(self):
@@ -1158,6 +1228,7 @@ class ResistanceApp(tk.Tk):
             ]
         )
         self.autosave_handle.flush()
+        self.last_autosave_flush = time.monotonic()
         self.autosave_var.set(f"自动CSV：{os.path.basename(self.autosave_path)}")
 
     def write_autosave_sample(self, sample):
@@ -1174,7 +1245,10 @@ class ResistanceApp(tk.Tk):
                     raw_line,
                 ]
             )
-            self.autosave_handle.flush()
+            now = time.monotonic()
+            if now - self.last_autosave_flush >= self.autosave_flush_interval:
+                self.autosave_handle.flush()
+                self.last_autosave_flush = now
         except Exception as exc:
             self.status_var.set(f"自动CSV写入失败：{exc}")
 
