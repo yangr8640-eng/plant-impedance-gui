@@ -160,6 +160,12 @@ def show_control_characters(text):
     return text.replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
 
 
+def safe_filename_part(value, fallback):
+    cleaned = re.sub(r'[<>:"/\\|?*\s]+', "_", str(value).strip())
+    cleaned = cleaned.strip("._")
+    return (cleaned[:40] or fallback)
+
+
 class SerialWorker:
     def __init__(self, event_queue):
         self.event_queue = event_queue
@@ -311,6 +317,7 @@ class SimplePDFReport:
     def _metadata_lines(self):
         metadata = self.stats.get("metadata", {})
         return [
+            f"通道：{metadata.get('channel', '--')}    串口：{metadata.get('serial_port', '--')}    波特率：{metadata.get('baudrate', '--')}",
             f"实验时间：{metadata.get('experiment_time', '--')}    测试时长：{metadata.get('duration', '--')}",
             f"植物编号：{metadata.get('plant_id', '--')}    电极位置：{metadata.get('electrode_position', '--')}    土壤状态：{metadata.get('soil_state', '--')}",
             f"温度：{metadata.get('temperature', '--')} °C    湿度：{metadata.get('humidity', '--')} %    Y格差：{metadata.get('y_grid_step', '--')}",
@@ -413,12 +420,11 @@ class SimplePDFReport:
         )
 
 
-class ResistanceApp(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("实时电阻曲线 GUI - Windows")
-        self.geometry("1180x820")
-        self.minsize(960, 680)
+class MeasurementChannel(ttk.Frame):
+    def __init__(self, master, app, channel_index):
+        super().__init__(master)
+        self.app = app
+        self.channel_index = channel_index
 
         self.data_points = deque(maxlen=20_000)
         self.raw_samples = deque(maxlen=20_000)
@@ -427,6 +433,8 @@ class ResistanceApp(tk.Tk):
         self.last_recorded_time = None
         self.raw_bytes = 0
         self.raw_records = 0
+        self.connected_port = None
+        self.measurement_source = None
         self.autosave_path = None
         self.autosave_handle = None
         self.autosave_writer = None
@@ -447,7 +455,7 @@ class ResistanceApp(tk.Tk):
         self.experiment_time_var = tk.StringVar(value=time.strftime("%Y-%m-%d %H:%M"))
         self.sample_interval_var = tk.StringVar(value="60")
         self.x_axis_hours_var = tk.StringVar(value="6")
-        self.plant_id_var = tk.StringVar(value="绿萝01")
+        self.plant_id_var = tk.StringVar(value=f"绿萝{channel_index:02d}")
         self.temperature_var = tk.StringVar()
         self.humidity_var = tk.StringVar()
         self.electrode_var = tk.StringVar(value="叶片两点")
@@ -461,19 +469,14 @@ class ResistanceApp(tk.Tk):
         self.plotted_points = []
 
         self._build_ui()
-        self.refresh_ports()
-        self.after(16, self.process_events)
-        self.protocol("WM_DELETE_WINDOW", self.close)
 
     def _build_ui(self):
-        self.configure(bg="#f5f7fb")
-
         header = ttk.Frame(self, padding=(16, 14, 16, 8))
         header.pack(fill="x")
 
-        title = ttk.Label(header, text="实时电阻曲线", font=("Microsoft YaHei UI", 22, "bold"))
+        title = ttk.Label(header, text=f"实时电阻曲线 - 通道{self.channel_index}", font=("Microsoft YaHei UI", 22, "bold"))
         title.pack(anchor="w")
-        subtitle = ttk.Label(header, text="Windows 本地 GUI，直接读取硬件串口数据并绘制电阻-时间曲线。")
+        subtitle = ttk.Label(header, text="Windows 本地 GUI，每个通道独立读取一个硬件串口并记录一株植物。")
         subtitle.pack(anchor="w", pady=(4, 0))
 
         controls = ttk.Frame(self, padding=(16, 8))
@@ -481,10 +484,12 @@ class ResistanceApp(tk.Tk):
 
         ttk.Label(controls, text="串口").pack(side="left")
         self.port_var = tk.StringVar()
+        self.port_var.trace_add("write", lambda *_args: self.update_tab_label())
+        self.plant_id_var.trace_add("write", lambda *_args: self.update_tab_label())
         self.port_combo = ttk.Combobox(controls, textvariable=self.port_var, width=18, state="readonly")
         self.port_combo.pack(side="left", padx=(6, 8))
 
-        ttk.Button(controls, text="刷新串口", command=self.refresh_ports).pack(side="left", padx=(0, 12))
+        ttk.Button(controls, text="刷新串口", command=self.app.refresh_all_ports).pack(side="left", padx=(0, 12))
 
         ttk.Label(controls, text="波特率").pack(side="left")
         self.baud_var = tk.StringVar(value="115200")
@@ -611,15 +616,41 @@ class ResistanceApp(tk.Tk):
         scrollbar.pack(side="right", fill="y")
         self.log.configure(yscrollcommand=scrollbar.set)
 
-    def refresh_ports(self):
+    def tab_label(self):
+        port = self.connected_port or self.port_var.get()
+        if not port or port.startswith("未"):
+            port = "未选择"
+        plant = value_or_dash(self.plant_id_var.get())
+        return f"通道{self.channel_index} · {port} · {plant}"
+
+    def update_tab_label(self):
+        self.app.update_tab_label(self)
+
+    def refresh_ports(self, ports=None):
         if list_ports is None:
             self.port_combo["values"] = ("未安装 pyserial",)
             self.port_var.set("未安装 pyserial")
             self.connect_button.configure(state="disabled")
             self.status_var.set("请先安装 pyserial：python -m pip install pyserial")
+            self.update_tab_label()
             return
 
-        ports = [port.device for port in list_ports.comports()]
+        if ports is None:
+            ports = [port.device for port in list_ports.comports()]
+
+        if self.connected_port:
+            values = list(ports)
+            if self.connected_port not in values:
+                values.insert(0, self.connected_port)
+            self.port_combo["values"] = values
+            self.port_var.set(self.connected_port)
+            self.connect_button.configure(state="disabled")
+            self.disconnect_button.configure(state="normal")
+            self.port_combo.configure(state="disabled")
+            self.baud_combo.configure(state="disabled")
+            self.update_tab_label()
+            return
+
         if not ports:
             self.port_combo["values"] = ("未发现串口",)
             self.port_var.set("未发现串口")
@@ -629,11 +660,18 @@ class ResistanceApp(tk.Tk):
             if self.port_var.get() not in ports:
                 self.port_var.set(ports[0])
             self.connect_button.configure(state="normal")
+        self.port_combo.configure(state="readonly")
+        self.baud_combo.configure(state="readonly")
+        self.update_tab_label()
 
     def connect_serial(self):
         port = self.port_var.get()
         if not port or port.startswith("未"):
             self.status_var.set("没有可用串口")
+            return
+        if self.app.is_port_in_use(port, self):
+            self.status_var.set(f"{port} 已被其他通道连接")
+            messagebox.showwarning("串口已占用", f"{port} 已被其他通道连接，请选择另一个串口。")
             return
 
         self.stop_simulation()
@@ -645,21 +683,32 @@ class ResistanceApp(tk.Tk):
             messagebox.showerror("连接失败", str(exc))
             return
 
+        self.connected_port = port
+        self.measurement_source = port
         self.status_var.set(f"已连接：{port}")
         self.connect_button.configure(state="disabled")
         self.disconnect_button.configure(state="normal")
+        self.port_combo.configure(state="disabled")
+        self.baud_combo.configure(state="disabled")
+        self.app.refresh_all_ports()
+        self.update_tab_label()
 
     def disconnect_serial(self):
         self.serial_worker.stop()
         self.cancel_auto_stop()
         saved_path = self.autosave_path
         self.close_autosave_file()
+        self.connected_port = None
         if saved_path:
             self.status_var.set(f"未连接，CSV 已保存：{os.path.basename(saved_path)}")
         else:
             self.status_var.set("未连接")
         self.connect_button.configure(state="normal")
         self.disconnect_button.configure(state="disabled")
+        self.port_combo.configure(state="readonly")
+        self.baud_combo.configure(state="readonly")
+        self.app.refresh_all_ports()
+        self.update_tab_label()
 
     def process_events(self):
         processed = 0
@@ -682,8 +731,7 @@ class ResistanceApp(tk.Tk):
                 self.disconnect_serial()
 
         self.flush_pending_ui_updates()
-        delay = 1 if not self.event_queue.empty() else 16
-        self.after(delay, self.process_events)
+        return not self.event_queue.empty()
 
     def handle_line(self, line):
         if self.auto_stopped:
@@ -1081,9 +1129,12 @@ class ResistanceApp(tk.Tk):
     def toggle_simulation(self):
         if self.simulation_job is not None:
             self.stop_simulation()
+            self.status_var.set("模拟数据已停止")
             return
-        self.disconnect_serial()
+        if self.connected_port:
+            self.disconnect_serial()
         self.auto_stopped = False
+        self.measurement_source = "模拟"
         self.status_var.set("模拟数据中")
         self._simulate_tick(0.0)
 
@@ -1122,6 +1173,7 @@ class ResistanceApp(tk.Tk):
         self.cancel_auto_stop()
         self.close_autosave_file()
         self.autosave_path = None
+        self.measurement_source = None
         self.autosave_var.set("自动CSV：未开始")
         self.raw_bytes = 0
         self.raw_records = 0
@@ -1188,8 +1240,11 @@ class ResistanceApp(tk.Tk):
         self.serial_worker.stop()
         saved_path = self.autosave_path
         self.close_autosave_file()
+        self.connected_port = None
         self.connect_button.configure(state="normal")
         self.disconnect_button.configure(state="disabled")
+        self.port_combo.configure(state="readonly")
+        self.baud_combo.configure(state="readonly")
         if saved_path:
             self.status_var.set(f"已到测试时长，CSV 已保存：{os.path.basename(saved_path)}")
         else:
@@ -1197,6 +1252,8 @@ class ResistanceApp(tk.Tk):
         self.append_log("已到测试时长，自动停止。")
         self.update_stats()
         self.redraw_chart()
+        self.app.refresh_all_ports()
+        self.update_tab_label()
 
     def append_log(self, line):
         stamp = time.strftime("%H:%M:%S")
@@ -1214,7 +1271,14 @@ class ResistanceApp(tk.Tk):
 
         output_dir = os.path.join(os.getcwd(), "output")
         os.makedirs(output_dir, exist_ok=True)
-        self.autosave_path = os.path.join(output_dir, f"植物阻抗自动记录_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+        channel_part = safe_filename_part(f"通道{self.channel_index}", f"channel{self.channel_index}")
+        port_label = self.measurement_source or self.connected_port or self.port_var.get()
+        port_part = safe_filename_part(port_label, "unknown_port")
+        plant_part = safe_filename_part(self.plant_id_var.get(), "unknown_plant")
+        self.autosave_path = os.path.join(
+            output_dir,
+            f"植物阻抗自动记录_{channel_part}_{port_part}_{plant_part}_{time.strftime('%Y%m%d_%H%M%S')}.csv",
+        )
         self.autosave_handle = open(self.autosave_path, "w", encoding="utf-8-sig", newline="")
         self.autosave_writer = csv.writer(self.autosave_handle)
         self.autosave_writer.writerow(
@@ -1267,7 +1331,9 @@ class ResistanceApp(tk.Tk):
             messagebox.showinfo("没有可导出的数据", "请先连接串口并采集到电阻数据。")
             return
 
-        default_name = f"植物阻抗测量报告_{time.strftime('%Y%m%d_%H%M%S')}.pdf"
+        channel_part = safe_filename_part(f"通道{self.channel_index}", f"channel{self.channel_index}")
+        plant_part = safe_filename_part(self.plant_id_var.get(), "unknown_plant")
+        default_name = f"植物阻抗测量报告_{channel_part}_{plant_part}_{time.strftime('%Y%m%d_%H%M%S')}.pdf"
         path = filedialog.asksaveasfilename(
             title="导出实验 PDF",
             defaultextension=".pdf",
@@ -1285,6 +1351,9 @@ class ResistanceApp(tk.Tk):
                 "window_seconds": window_seconds,
                 "y_grid_step_value": self.y_grid_step(),
                 "metadata": {
+                    "channel": f"通道{self.channel_index}",
+                    "serial_port": value_or_dash(self.measurement_source or self.connected_port or self.port_var.get()),
+                    "baudrate": value_or_dash(self.baud_var.get()),
                     "experiment_time": value_or_dash(self.experiment_time_var.get()),
                     "duration": f"{trim_number(window_seconds / 3600)} 小时    记录间隔：{trim_number(self.sample_interval())} 秒",
                     "plant_id": value_or_dash(self.plant_id_var.get()),
@@ -1306,7 +1375,9 @@ class ResistanceApp(tk.Tk):
             messagebox.showinfo("没有可导出的记录数据", "请先连接串口并记录到电阻数据。")
             return
 
-        default_name = f"植物阻抗记录数据_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+        channel_part = safe_filename_part(f"通道{self.channel_index}", f"channel{self.channel_index}")
+        plant_part = safe_filename_part(self.plant_id_var.get(), "unknown_plant")
+        default_name = f"植物阻抗记录数据_{channel_part}_{plant_part}_{time.strftime('%Y%m%d_%H%M%S')}.csv"
         path = filedialog.asksaveasfilename(
             title="导出记录数据 CSV",
             defaultextension=".csv",
@@ -1352,8 +1423,73 @@ class ResistanceApp(tk.Tk):
 
     def close(self):
         self.stop_simulation()
+        self.cancel_auto_stop()
         self.serial_worker.stop()
         self.close_autosave_file()
+
+
+class ResistanceApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("四路实时电阻曲线 GUI - Windows")
+        self.geometry("1240x860")
+        self.minsize(980, 700)
+        self.configure(bg="#f5f7fb")
+
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill="both", expand=True)
+
+        self.channels = []
+        for index in range(1, 5):
+            channel = MeasurementChannel(self.notebook, self, index)
+            self.channels.append(channel)
+            self.notebook.add(channel, text=channel.tab_label())
+
+        self.refresh_all_ports()
+        self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_changed)
+        self.after(16, self.process_events)
+        self.protocol("WM_DELETE_WINDOW", self.close)
+
+    def refresh_all_ports(self):
+        ports = None
+        if list_ports is not None:
+            ports = [port.device for port in list_ports.comports()]
+        for channel in self.channels:
+            channel.refresh_ports(ports)
+
+    def is_port_in_use(self, port, requester):
+        return any(channel is not requester and channel.connected_port == port for channel in self.channels)
+
+    def update_tab_label(self, channel):
+        if not hasattr(self, "notebook"):
+            return
+        try:
+            self.notebook.index(channel)
+        except tk.TclError:
+            return
+        self.notebook.tab(channel, text=channel.tab_label())
+
+    def on_tab_changed(self, _event):
+        channel = self.current_channel()
+        if channel is not None:
+            channel.flush_pending_ui_updates(force=True)
+
+    def current_channel(self):
+        selected = self.notebook.select()
+        if not selected:
+            return None
+        widget = self.nametowidget(selected)
+        return widget if isinstance(widget, MeasurementChannel) else None
+
+    def process_events(self):
+        has_pending = False
+        for channel in self.channels:
+            has_pending = channel.process_events() or has_pending
+        self.after(1 if has_pending else 16, self.process_events)
+
+    def close(self):
+        for channel in self.channels:
+            channel.close()
         self.destroy()
 
 
