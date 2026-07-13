@@ -4,7 +4,6 @@ import os
 import queue
 import random
 import re
-import shutil
 import threading
 import time
 import tkinter as tk
@@ -164,6 +163,26 @@ def safe_filename_part(value, fallback):
     cleaned = re.sub(r'[<>:"/\\|?*\s]+', "_", str(value).strip())
     cleaned = cleaned.strip("._")
     return (cleaned[:40] or fallback)
+
+
+def parse_epoch_plan(epoch_count_text, epoch_duration_text, duration_unit):
+    """校验 epoch 设置并返回 (epoch 数量, 单个 epoch 秒数)。"""
+    count_text = str(epoch_count_text).strip()
+    if not re.fullmatch(r"[1-9]\d*", count_text):
+        raise ValueError("epoch 数量必须是大于 0 的整数。")
+    count = int(count_text)
+
+    try:
+        duration = float(str(epoch_duration_text).strip())
+    except ValueError as exc:
+        raise ValueError("每个 epoch 的测量时长必须是大于 0 的数字。") from exc
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError("每个 epoch 的测量时长必须是大于 0 的数字。")
+
+    unit_factors = {"秒": 1, "分钟": 60, "小时": 3600}
+    if duration_unit not in unit_factors:
+        raise ValueError("epoch 时长单位必须是秒、分钟或小时。")
+    return count, duration * unit_factors[duration_unit]
 
 
 class SerialWorker:
@@ -438,6 +457,13 @@ class MeasurementChannel(ttk.Frame):
         self.autosave_path = None
         self.autosave_handle = None
         self.autosave_writer = None
+        self.epoch_paths = []
+        self.session_file_prefix = None
+        self.current_epoch = 0
+        self.epoch_record_index = 0
+        self.epoch_start_time = None
+        self.active_epoch_count = 0
+        self.active_epoch_duration = 0.0
         self.event_queue = queue.Queue()
         self.serial_worker = SerialWorker(self.event_queue)
         self.simulation_job = None
@@ -455,6 +481,10 @@ class MeasurementChannel(ttk.Frame):
         self.experiment_time_var = tk.StringVar(value=time.strftime("%Y-%m-%d %H:%M"))
         self.sample_interval_var = tk.StringVar(value="60")
         self.x_axis_hours_var = tk.StringVar(value="6")
+        self.epoch_count_var = tk.StringVar(value="1")
+        self.epoch_duration_var = tk.StringVar(value="24")
+        self.epoch_duration_unit_var = tk.StringVar(value="小时")
+        self.epoch_plan_var = tk.StringVar(value="总时长：24 h")
         self.plant_id_var = tk.StringVar(value=f"绿萝{channel_index:02d}")
         self.temperature_var = tk.StringVar()
         self.humidity_var = tk.StringVar()
@@ -469,6 +499,9 @@ class MeasurementChannel(ttk.Frame):
         self.plotted_points = []
 
         self._build_ui()
+        self.epoch_count_var.trace_add("write", lambda *_args: self.update_epoch_plan_preview())
+        self.epoch_duration_var.trace_add("write", lambda *_args: self.update_epoch_plan_preview())
+        self.epoch_duration_unit_var.trace_add("write", lambda *_args: self.update_epoch_plan_preview())
 
     def _build_ui(self):
         header = ttk.Frame(self, padding=(16, 14, 16, 8))
@@ -502,7 +535,7 @@ class MeasurementChannel(ttk.Frame):
         )
         self.baud_combo.pack(side="left", padx=(6, 12))
 
-        self.connect_button = ttk.Button(controls, text="连接", command=self.connect_serial)
+        self.connect_button = ttk.Button(controls, text="连接并开始测量", command=self.connect_serial)
         self.connect_button.pack(side="left")
         self.disconnect_button = ttk.Button(controls, text="断开", command=self.disconnect_serial, state="disabled")
         self.disconnect_button.pack(side="left", padx=(6, 12))
@@ -524,11 +557,24 @@ class MeasurementChannel(ttk.Frame):
         ttk.Label(experiment, text="实验时间").pack(side="left")
         ttk.Entry(experiment, textvariable=self.experiment_time_var, width=18).pack(side="left", padx=(6, 12))
 
-        ttk.Label(experiment, text="测试时长(h)").pack(side="left")
-        self.window_var = tk.StringVar(value="24")
-        window_entry = ttk.Entry(experiment, textvariable=self.window_var, width=8)
-        window_entry.pack(side="left", padx=(6, 12))
-        window_entry.bind("<Return>", lambda _event: self.update_duration_setting())
+        ttk.Label(experiment, text="epoch 数量").pack(side="left")
+        self.epoch_count_entry = ttk.Entry(experiment, textvariable=self.epoch_count_var, width=5)
+        self.epoch_count_entry.pack(side="left", padx=(6, 10))
+        self.epoch_count_entry.bind("<Return>", lambda _event: self.update_duration_setting())
+
+        ttk.Label(experiment, text="每个 epoch 时长").pack(side="left")
+        self.epoch_duration_entry = ttk.Entry(experiment, textvariable=self.epoch_duration_var, width=7)
+        self.epoch_duration_entry.pack(side="left", padx=(6, 4))
+        self.epoch_duration_entry.bind("<Return>", lambda _event: self.update_duration_setting())
+        self.epoch_unit_combo = ttk.Combobox(
+            experiment,
+            textvariable=self.epoch_duration_unit_var,
+            values=("秒", "分钟", "小时"),
+            width=5,
+            state="readonly",
+        )
+        self.epoch_unit_combo.pack(side="left", padx=(0, 10))
+        ttk.Label(experiment, textvariable=self.epoch_plan_var).pack(side="left", padx=(0, 12))
 
         ttk.Label(experiment, text="记录间隔(s)").pack(side="left")
         interval_entry = ttk.Entry(experiment, textvariable=self.sample_interval_var, width=7)
@@ -538,6 +584,9 @@ class MeasurementChannel(ttk.Frame):
         x_axis_entry = ttk.Entry(experiment, textvariable=self.x_axis_hours_var, width=7)
         x_axis_entry.pack(side="left", padx=(6, 12))
         x_axis_entry.bind("<Return>", lambda _event: self.reset_zoom())
+
+        experiment = ttk.Frame(self, padding=(16, 2, 16, 8))
+        experiment.pack(fill="x")
 
         ttk.Label(experiment, text="植物编号").pack(side="left")
         ttk.Entry(experiment, textvariable=self.plant_id_var, width=10).pack(side="left", padx=(6, 12))
@@ -582,6 +631,7 @@ class MeasurementChannel(ttk.Frame):
         self.parsed_var = tk.StringVar(value="解析成功：0")
         self.raw_var = tk.StringVar(value="保存记录：0")
         self.autosave_var = tk.StringVar(value="自动CSV：未开始")
+        self.epoch_status_var = tk.StringVar(value="epoch：未开始")
 
         for variable in (
             self.status_var,
@@ -592,9 +642,13 @@ class MeasurementChannel(ttk.Frame):
             self.bytes_var,
             self.parsed_var,
             self.raw_var,
-            self.autosave_var,
         ):
             ttk.Label(status, textvariable=variable).pack(side="left", padx=(0, 16))
+
+        storage_status = ttk.Frame(self, padding=(16, 0, 16, 8))
+        storage_status.pack(fill="x")
+        ttk.Label(storage_status, textvariable=self.epoch_status_var).pack(side="left", padx=(0, 16))
+        ttk.Label(storage_status, textvariable=self.autosave_var).pack(side="left")
 
         self.canvas = tk.Canvas(self, bg="#fbfcff", highlightthickness=1, highlightbackground="#d9e1ed")
         self.canvas.pack(fill="both", expand=True, padx=16, pady=(0, 12))
@@ -674,18 +728,26 @@ class MeasurementChannel(ttk.Frame):
             messagebox.showwarning("串口已占用", f"{port} 已被其他通道连接，请选择另一个串口。")
             return
 
-        self.stop_simulation()
-        self.auto_stopped = False
         try:
+            epoch_count, epoch_duration = self.configured_epoch_plan()
+        except ValueError as exc:
+            messagebox.showerror("epoch 设置无效", str(exc))
+            return
+
+        self.stop_simulation()
+        try:
+            self.clear_pending_serial_events()
             self.serial_worker.start(port, int(self.baud_var.get()))
+            self.begin_measurement_session(port, epoch_count, epoch_duration)
         except Exception as exc:
+            self.serial_worker.stop()
             self.status_var.set(f"连接失败：{exc}")
             messagebox.showerror("连接失败", str(exc))
             return
 
         self.connected_port = port
         self.measurement_source = port
-        self.status_var.set(f"已连接：{port}")
+        self.status_var.set(f"已开始测量：{port}，epoch 1/{epoch_count}")
         self.connect_button.configure(state="disabled")
         self.disconnect_button.configure(state="normal")
         self.port_combo.configure(state="disabled")
@@ -697,10 +759,20 @@ class MeasurementChannel(ttk.Frame):
         self.serial_worker.stop()
         self.cancel_auto_stop()
         saved_path = self.autosave_path
-        self.close_autosave_file()
+        if self.measurement_is_running():
+            try:
+                self.finish_current_epoch()
+            except Exception as exc:
+                self.abort_measurement_for_storage_error(exc)
+                return
+            self.auto_stopped = True
+            self.set_epoch_controls_enabled(True)
+            self.epoch_status_var.set(
+                f"epoch：{self.current_epoch}/{self.active_epoch_count} 已手动停止"
+            )
         self.connected_port = None
         if saved_path:
-            self.status_var.set(f"未连接，CSV 已保存：{os.path.basename(saved_path)}")
+            self.status_var.set(f"已手动停止，当前 epoch 已保存：{os.path.basename(saved_path)}")
         else:
             self.status_var.set("未连接")
         self.connect_button.configure(state="normal")
@@ -727,16 +799,26 @@ class MeasurementChannel(ttk.Frame):
             elif event == "line":
                 self.handle_line(payload)
             elif event == "error":
-                self.status_var.set(f"读取失败：{payload}")
-                self.disconnect_serial()
+                if not self.auto_stopped:
+                    self.status_var.set(f"读取失败：{payload}")
+                    self.disconnect_serial()
 
         self.flush_pending_ui_updates()
         return not self.event_queue.empty()
+
+    def clear_pending_serial_events(self):
+        while True:
+            try:
+                self.event_queue.get_nowait()
+            except queue.Empty:
+                return
 
     def handle_line(self, line):
         if self.auto_stopped:
             return
         now = time.monotonic()
+        if not self.advance_epoch_if_needed(now):
+            return
         if not self.should_record_sample(now):
             return
         resistance = ResistanceParser.parse(line)
@@ -745,9 +827,6 @@ class MeasurementChannel(ttk.Frame):
             self.request_ui_update()
             return
 
-        if self.start_time is not None and now - self.start_time > self.measurement_duration():
-            self.auto_stop_measurement()
-            return
         self.record_raw_sample(line, resistance, now)
         self.append_data_point(resistance, line, now)
 
@@ -793,10 +872,16 @@ class MeasurementChannel(ttk.Frame):
             self.raw_start_time = now_monotonic
         self.last_recorded_time = now_monotonic
         self.raw_records += 1
+        self.epoch_record_index += 1
+        experiment_elapsed = max(0.0, now_monotonic - self.start_time)
+        epoch_elapsed = max(0.0, now_monotonic - self.epoch_start_time)
         sample = (
             self.raw_records,
+            self.current_epoch,
+            self.epoch_record_index,
             time.time(),
-            now_monotonic - self.raw_start_time,
+            experiment_elapsed,
+            epoch_elapsed,
             raw_line,
             parsed_resistance,
         )
@@ -809,19 +894,15 @@ class MeasurementChannel(ttk.Frame):
         if now is None:
             now = time.monotonic()
         if self.start_time is None:
-            self.start_time = now
-            self.schedule_auto_stop()
+            return
         elapsed = now - self.start_time
         duration = self.measurement_duration()
         if elapsed > duration:
-            self.auto_stop_measurement()
             return
         self.data_points.append((elapsed, resistance, raw_line))
 
         self.append_log(f"{format_resistance(resistance, preferred='kohm')} <= {show_control_characters(raw_line)}")
         self.request_ui_update(redraw=True)
-        if elapsed >= duration:
-            self.auto_stop_measurement()
 
     def visible_points(self):
         if not self.data_points:
@@ -1129,13 +1210,22 @@ class MeasurementChannel(ttk.Frame):
     def toggle_simulation(self):
         if self.simulation_job is not None:
             self.stop_simulation()
-            self.status_var.set("模拟数据已停止")
+            self.stop_measurement_early("模拟数据已停止")
+            return
+        try:
+            epoch_count, epoch_duration = self.configured_epoch_plan()
+        except ValueError as exc:
+            messagebox.showerror("epoch 设置无效", str(exc))
             return
         if self.connected_port:
             self.disconnect_serial()
-        self.auto_stopped = False
-        self.measurement_source = "模拟"
-        self.status_var.set("模拟数据中")
+        try:
+            self.begin_measurement_session("模拟", epoch_count, epoch_duration)
+        except Exception as exc:
+            self.status_var.set(f"无法开始模拟测量：{exc}")
+            messagebox.showerror("无法开始测量", str(exc))
+            return
+        self.status_var.set(f"模拟数据中，epoch 1/{epoch_count}")
         self._simulate_tick(0.0)
 
     def _simulate_tick(self, phase):
@@ -1146,11 +1236,10 @@ class MeasurementChannel(ttk.Frame):
         value = max(0.1, baseline + ripple + noise)
         raw_line = f"R={trim_number(value)} ohm"
         now = time.monotonic()
+        if not self.advance_epoch_if_needed(now):
+            return
         if not self.should_record_sample(now):
             self.simulation_job = self.after(350, lambda: self._simulate_tick(phase))
-            return
-        if self.start_time is not None and now - self.start_time > self.measurement_duration():
-            self.auto_stop_measurement()
             return
         self.record_raw_sample(raw_line, value, now)
         self.append_data_point(value, raw_line, now)
@@ -1160,39 +1249,138 @@ class MeasurementChannel(ttk.Frame):
 
     def stop_simulation(self):
         if self.simulation_job is not None:
-            self.after_cancel(self.simulation_job)
+            try:
+                self.after_cancel(self.simulation_job)
+            except tk.TclError:
+                pass
             self.simulation_job = None
 
     def clear_data(self):
+        if self.connected_port:
+            self.serial_worker.stop()
+            self.connected_port = None
+            self.connect_button.configure(state="normal")
+            self.disconnect_button.configure(state="disabled")
+            self.port_combo.configure(state="readonly")
+            self.baud_combo.configure(state="readonly")
+        self.stop_simulation()
         self.data_points.clear()
         self.raw_samples.clear()
         self.start_time = None
         self.raw_start_time = None
+        self.epoch_start_time = None
         self.last_recorded_time = None
         self.auto_stopped = False
         self.cancel_auto_stop()
         self.close_autosave_file()
         self.autosave_path = None
+        self.epoch_paths = []
+        self.session_file_prefix = None
+        self.current_epoch = 0
+        self.epoch_record_index = 0
+        self.active_epoch_count = 0
+        self.active_epoch_duration = 0.0
         self.measurement_source = None
         self.autosave_var.set("自动CSV：未开始")
+        self.epoch_status_var.set("epoch：未开始")
+        self.set_epoch_controls_enabled(True)
         self.raw_bytes = 0
         self.raw_records = 0
         self.log.delete("1.0", "end")
         self.log_line_count = 0
         self.update_stats()
         self.redraw_chart()
+        self.app.refresh_all_ports()
+        self.update_tab_label()
 
     def update_duration_setting(self):
+        self.update_epoch_plan_preview()
         self.redraw_chart()
+
+    def configured_epoch_plan(self):
+        return parse_epoch_plan(
+            self.epoch_count_var.get(),
+            self.epoch_duration_var.get(),
+            self.epoch_duration_unit_var.get(),
+        )
+
+    def update_epoch_plan_preview(self):
+        try:
+            count, duration = self.configured_epoch_plan()
+        except ValueError:
+            self.epoch_plan_var.set("总时长：--")
+            return
+        total = count * duration
+        if total >= 3600:
+            text = f"{trim_number(total / 3600)} h"
+        elif total >= 60:
+            text = f"{trim_number(total / 60)} min"
+        else:
+            text = f"{trim_number(total)} s"
+        self.epoch_plan_var.set(f"总时长：{text}")
+
+    def set_epoch_controls_enabled(self, enabled):
+        entry_state = "normal" if enabled else "disabled"
+        combo_state = "readonly" if enabled else "disabled"
+        self.epoch_count_entry.configure(state=entry_state)
+        self.epoch_duration_entry.configure(state=entry_state)
+        self.epoch_unit_combo.configure(state=combo_state)
+
+    def measurement_is_running(self):
+        return self.start_time is not None and not self.auto_stopped and self.current_epoch > 0
+
+    def begin_measurement_session(self, source, epoch_count, epoch_duration):
+        self.cancel_auto_stop()
+        self.close_autosave_file()
+        self.data_points.clear()
+        self.raw_samples.clear()
+        self.raw_bytes = 0
+        self.raw_records = 0
+        self.last_recorded_time = None
+        self.epoch_paths = []
+        self.autosave_path = None
+
+        now = time.monotonic()
+        self.start_time = now
+        self.raw_start_time = now
+        self.epoch_start_time = now
+        self.active_epoch_count = epoch_count
+        self.active_epoch_duration = epoch_duration
+        self.current_epoch = 1
+        self.epoch_record_index = 0
+        self.auto_stopped = False
+        self.measurement_source = source
+        wall_time = time.time()
+        stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(wall_time))
+        self.session_file_prefix = f"{stamp}_{int(wall_time * 1000) % 1000:03d}"
+        self.set_epoch_controls_enabled(False)
+        try:
+            self.ensure_autosave_file()
+        except Exception:
+            self.auto_stopped = True
+            self.start_time = None
+            self.raw_start_time = None
+            self.epoch_start_time = None
+            self.current_epoch = 0
+            self.close_autosave_file()
+            self.set_epoch_controls_enabled(True)
+            raise
+        self.epoch_status_var.set(f"epoch：1/{epoch_count}")
+        self.append_log(
+            f"开始测量：共 {epoch_count} 个 epoch，"
+            f"每个 {trim_number(epoch_duration)} 秒。"
+        )
         self.schedule_auto_stop()
+        self.request_ui_update(redraw=True)
 
     def measurement_duration(self):
+        if self.active_epoch_count > 0 and self.active_epoch_duration > 0:
+            return self.active_epoch_count * self.active_epoch_duration
         try:
-            hours = float(self.window_var.get().strip())
+            count, duration = self.configured_epoch_plan()
         except ValueError:
-            hours = 24
-        seconds = hours * 3600
-        return max(5, min(86400, seconds))
+            return 24 * 3600
+        return count * duration
 
     def sample_interval(self):
         try:
@@ -1211,17 +1399,25 @@ class MeasurementChannel(ttk.Frame):
             return None
         if hours <= 0:
             return None
-        return min(self.measurement_duration(), max(5, hours * 3600))
+        return min(self.measurement_duration(), max(1, hours * 3600))
 
     def schedule_auto_stop(self):
         self.cancel_auto_stop()
-        if self.start_time is None or self.auto_stopped:
+        if not self.measurement_is_running():
             return
-        remaining = self.measurement_duration() - (time.monotonic() - self.start_time)
+        epoch_end = self.epoch_start_time + self.active_epoch_duration
+        remaining = epoch_end - time.monotonic()
         if remaining <= 0:
-            self.auto_stop_measurement()
+            self.advance_epoch_if_needed(time.monotonic())
             return
-        self.auto_stop_job = self.after(int(remaining * 1000), self.auto_stop_measurement)
+        # 长时实验分段检查，避免 Tk 超长定时器整数溢出。
+        delay_ms = max(1, int(min(remaining, 60) * 1000))
+        self.auto_stop_job = self.after(delay_ms, self.check_epoch_boundary)
+
+    def check_epoch_boundary(self):
+        self.auto_stop_job = None
+        if self.advance_epoch_if_needed(time.monotonic()):
+            self.schedule_auto_stop()
 
     def cancel_auto_stop(self):
         if self.auto_stop_job is not None:
@@ -1231,25 +1427,106 @@ class MeasurementChannel(ttk.Frame):
                 pass
             self.auto_stop_job = None
 
-    def auto_stop_measurement(self):
-        if self.auto_stopped:
-            return
+    def advance_epoch_if_needed(self, now=None):
+        if not self.measurement_is_running():
+            return False
+        if now is None:
+            now = time.monotonic()
+
+        try:
+            while now >= self.epoch_start_time + self.active_epoch_duration:
+                finished_epoch = self.current_epoch
+                boundary = self.epoch_start_time + self.active_epoch_duration
+                saved_path = self.finish_current_epoch()
+                self.append_log(
+                    f"epoch {finished_epoch}/{self.active_epoch_count} 已完成，"
+                    f"原始数据已保存：{os.path.basename(saved_path)}"
+                )
+                if finished_epoch >= self.active_epoch_count:
+                    self.auto_stop_measurement(epoch_already_closed=True)
+                    return False
+
+                self.current_epoch += 1
+                self.epoch_start_time = boundary
+                self.epoch_record_index = 0
+                self.last_recorded_time = None
+                self.autosave_path = None
+                self.ensure_autosave_file()
+                self.epoch_status_var.set(f"epoch：{self.current_epoch}/{self.active_epoch_count}")
+                self.status_var.set(f"epoch {finished_epoch} 已保存，正在测量 epoch {self.current_epoch}")
+        except Exception as exc:
+            self.abort_measurement_for_storage_error(exc)
+            return False
+        return True
+
+    def abort_measurement_for_storage_error(self, exc):
         self.auto_stopped = True
         self.cancel_auto_stop()
         self.stop_simulation()
         self.serial_worker.stop()
-        saved_path = self.autosave_path
-        self.close_autosave_file()
+        try:
+            self.close_autosave_file()
+        except Exception:
+            pass
         self.connected_port = None
+        self.set_epoch_controls_enabled(True)
         self.connect_button.configure(state="normal")
         self.disconnect_button.configure(state="disabled")
         self.port_combo.configure(state="readonly")
         self.baud_combo.configure(state="readonly")
-        if saved_path:
-            self.status_var.set(f"已到测试时长，CSV 已保存：{os.path.basename(saved_path)}")
-        else:
-            self.status_var.set("已到测试时长，自动停止")
-        self.append_log("已到测试时长，自动停止。")
+        self.status_var.set(f"epoch 文件保存失败，测量已停止：{exc}")
+        self.append_log(f"epoch 文件保存失败，测量已停止：{exc}")
+        messagebox.showerror("测量已停止", f"epoch 原始数据文件保存失败：\n{exc}")
+        self.app.refresh_all_ports()
+        self.update_tab_label()
+
+    def finish_current_epoch(self):
+        self.ensure_autosave_file()
+        saved_path = self.autosave_path
+        self.close_autosave_file()
+        return saved_path
+
+    def stop_measurement_early(self, status_text):
+        if self.measurement_is_running():
+            try:
+                saved_path = self.finish_current_epoch()
+            except Exception as exc:
+                self.abort_measurement_for_storage_error(exc)
+                return
+            self.append_log(
+                f"测量已手动停止，epoch {self.current_epoch} 已保存："
+                f"{os.path.basename(saved_path)}"
+            )
+        self.auto_stopped = True
+        self.cancel_auto_stop()
+        self.set_epoch_controls_enabled(True)
+        if self.current_epoch:
+            self.epoch_status_var.set(
+                f"epoch：{self.current_epoch}/{self.active_epoch_count} 已手动停止"
+            )
+        self.status_var.set(status_text)
+
+    def auto_stop_measurement(self, epoch_already_closed=False):
+        if self.auto_stopped:
+            return
+        self.auto_stopped = True
+        self.cancel_auto_stop()
+        if not epoch_already_closed:
+            self.finish_current_epoch()
+        self.stop_simulation()
+        self.serial_worker.stop()
+        self.connected_port = None
+        self.set_epoch_controls_enabled(True)
+        self.connect_button.configure(state="normal")
+        self.disconnect_button.configure(state="disabled")
+        self.port_combo.configure(state="readonly")
+        self.baud_combo.configure(state="readonly")
+        self.epoch_status_var.set(f"epoch：{self.active_epoch_count}/{self.active_epoch_count} 已完成")
+        self.status_var.set(
+            f"全部 {self.active_epoch_count} 个 epoch 已完成，"
+            f"已保存 {len(self.epoch_paths)} 个 CSV"
+        )
+        self.append_log("全部 epoch 已完成，测量自动停止。")
         self.update_stats()
         self.redraw_chart()
         self.app.refresh_all_ports()
@@ -1275,22 +1552,29 @@ class MeasurementChannel(ttk.Frame):
         port_label = self.measurement_source or self.connected_port or self.port_var.get()
         port_part = safe_filename_part(port_label, "unknown_port")
         plant_part = safe_filename_part(self.plant_id_var.get(), "unknown_plant")
+        session_part = self.session_file_prefix or time.strftime("%Y%m%d_%H%M%S")
+        epoch_number = max(1, self.current_epoch)
         self.autosave_path = os.path.join(
             output_dir,
-            f"植物阻抗自动记录_{channel_part}_{port_part}_{plant_part}_{time.strftime('%Y%m%d_%H%M%S')}.csv",
+            f"植物阻抗自动记录_{channel_part}_{port_part}_{plant_part}_{session_part}_epoch{epoch_number}.csv",
         )
         self.autosave_handle = open(self.autosave_path, "w", encoding="utf-8-sig", newline="")
         self.autosave_writer = csv.writer(self.autosave_handle)
         self.autosave_writer.writerow(
             [
                 "index",
+                "epoch",
+                "epoch_index",
                 "received_at",
-                "elapsed_s",
+                "epoch_elapsed_s",
+                "experiment_elapsed_s",
                 "parsed_resistance_ohm",
                 "parsed_resistance_kohm",
                 "raw_line",
             ]
         )
+        if self.autosave_path not in self.epoch_paths:
+            self.epoch_paths.append(self.autosave_path)
         self.autosave_handle.flush()
         self.last_autosave_flush = time.monotonic()
         self.autosave_var.set(f"自动CSV：{os.path.basename(self.autosave_path)}")
@@ -1298,12 +1582,24 @@ class MeasurementChannel(ttk.Frame):
     def write_autosave_sample(self, sample):
         try:
             self.ensure_autosave_file()
-            index, received_at, elapsed, raw_line, parsed_resistance = sample
+            (
+                index,
+                epoch,
+                epoch_index,
+                received_at,
+                experiment_elapsed,
+                epoch_elapsed,
+                raw_line,
+                parsed_resistance,
+            ) = sample
             self.autosave_writer.writerow(
                 [
                     index,
+                    epoch,
+                    epoch_index,
                     time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(received_at)),
-                    f"{elapsed:.6f}",
+                    f"{epoch_elapsed:.6f}",
+                    f"{experiment_elapsed:.6f}",
                     "" if parsed_resistance is None else f"{parsed_resistance:.6f}",
                     "" if parsed_resistance is None else f"{parsed_resistance / 1000:.6f}",
                     raw_line,
@@ -1314,7 +1610,7 @@ class MeasurementChannel(ttk.Frame):
                 self.autosave_handle.flush()
                 self.last_autosave_flush = now
         except Exception as exc:
-            self.status_var.set(f"自动CSV写入失败：{exc}")
+            self.abort_measurement_for_storage_error(exc)
 
     def close_autosave_file(self):
         if self.autosave_handle is None:
@@ -1355,7 +1651,12 @@ class MeasurementChannel(ttk.Frame):
                     "serial_port": value_or_dash(self.measurement_source or self.connected_port or self.port_var.get()),
                     "baudrate": value_or_dash(self.baud_var.get()),
                     "experiment_time": value_or_dash(self.experiment_time_var.get()),
-                    "duration": f"{trim_number(window_seconds / 3600)} 小时    记录间隔：{trim_number(self.sample_interval())} 秒",
+                    "duration": (
+                        f"{self.active_epoch_count or self.configured_epoch_plan()[0]} 个 epoch × "
+                        f"{trim_number(self.active_epoch_duration or self.configured_epoch_plan()[1])} 秒    "
+                        f"总时长：{trim_number(window_seconds / 3600)} 小时    "
+                        f"记录间隔：{trim_number(self.sample_interval())} 秒"
+                    ),
                     "plant_id": value_or_dash(self.plant_id_var.get()),
                     "temperature": value_or_dash(self.temperature_var.get()),
                     "humidity": value_or_dash(self.humidity_var.get()),
@@ -1371,7 +1672,8 @@ class MeasurementChannel(ttk.Frame):
             messagebox.showerror("导出失败", str(exc))
 
     def export_raw_csv(self):
-        if not self.raw_samples and not self.autosave_path:
+        source_paths = [path for path in self.epoch_paths if os.path.exists(path)]
+        if not self.raw_samples and not source_paths:
             messagebox.showinfo("没有可导出的记录数据", "请先连接串口并记录到电阻数据。")
             return
 
@@ -1388,30 +1690,58 @@ class MeasurementChannel(ttk.Frame):
             return
 
         try:
-            if self.autosave_path and os.path.exists(self.autosave_path):
-                if self.autosave_handle is not None:
-                    self.autosave_handle.flush()
-                if os.path.abspath(self.autosave_path) != os.path.abspath(path):
-                    shutil.copyfile(self.autosave_path, path)
+            if self.autosave_handle is not None:
+                self.autosave_handle.flush()
+            if any(os.path.abspath(source) == os.path.abspath(path) for source in source_paths):
+                raise ValueError("导出路径不能覆盖自动保存的 epoch 原始数据文件。")
+
+            if source_paths:
+                with open(path, "w", encoding="utf-8-sig", newline="") as handle:
+                    writer = csv.writer(handle)
+                    wrote_header = False
+                    for source in source_paths:
+                        with open(source, "r", encoding="utf-8-sig", newline="") as source_handle:
+                            reader = csv.reader(source_handle)
+                            header = next(reader, None)
+                            if header and not wrote_header:
+                                writer.writerow(header)
+                                wrote_header = True
+                            writer.writerows(reader)
             else:
                 with open(path, "w", encoding="utf-8-sig", newline="") as handle:
                     writer = csv.writer(handle)
                     writer.writerow(
                         [
                             "index",
+                            "epoch",
+                            "epoch_index",
                             "received_at",
-                            "elapsed_s",
+                            "epoch_elapsed_s",
+                            "experiment_elapsed_s",
                             "parsed_resistance_ohm",
                             "parsed_resistance_kohm",
                             "raw_line",
                         ]
                     )
-                    for index, received_at, elapsed, raw_line, parsed_resistance in self.raw_samples:
+                    for sample in self.raw_samples:
+                        (
+                            index,
+                            epoch,
+                            epoch_index,
+                            received_at,
+                            experiment_elapsed,
+                            epoch_elapsed,
+                            raw_line,
+                            parsed_resistance,
+                        ) = sample
                         writer.writerow(
                             [
                                 index,
+                                epoch,
+                                epoch_index,
                                 time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(received_at)),
-                                f"{elapsed:.6f}",
+                                f"{epoch_elapsed:.6f}",
+                                f"{experiment_elapsed:.6f}",
                                 "" if parsed_resistance is None else f"{parsed_resistance:.6f}",
                                 "" if parsed_resistance is None else f"{parsed_resistance / 1000:.6f}",
                                 raw_line,
