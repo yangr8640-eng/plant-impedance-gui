@@ -1,0 +1,11 @@
+{
+  "camera": {
+    "id": "请替换为--list-cameras显示的VID:PID"
+  },
+  "interval_seconds": 60,
+  "timepoints": [
+    "08:00",
+    "12:00",
+    "18:00"
+  ]
+}

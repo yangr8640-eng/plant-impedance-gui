@@ -1,0 +1,5 @@
+__pycache__/
+camera_gui_config.json
+camera_gui.log
+camera_timer.log
+output/
